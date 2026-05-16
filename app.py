@@ -15,17 +15,17 @@ st.set_page_config(page_title="稅式支出評估報告驗證工具", layout="wi
 
 def extract_document(doc):
     """
-    Walk the document body in order, tracking page numbers via:
-      1. w:lastRenderedPageBreak — Word's soft/auto page break record (most common)
-      2. w:br w:type="page"     — explicit user-inserted page break
-    For a paragraph: if any of the above appears BEFORE text in a run,
-    the paragraph starts on a new page (increment before recording).
-    Explicit breaks at the END of a paragraph push NEXT element to new page.
-    For tables: record start page, then accumulate all breaks inside to keep
-    current_page correct for subsequent body elements.
+    Walk the document body tracking page numbers via w:lastRenderedPageBreak
+    and explicit w:br w:type='page'.
+
+    Tables are stored as a single entry (all rows intact, so find_table_by_header
+    still sees the full table), but each row also carries its own page number in
+    row_pages so page attribution is per-row, not per-table-start.
+
     Returns:
       para_list  : [(page_num, text), ...]
-      table_list : [(page_num, [[cell,...], ...]), ...]
+      table_list : [(start_page, rows, row_pages), ...]
+                   where row_pages[i] is the page for rows[i]
     """
     current_page = 1
     para_list = []
@@ -48,7 +48,6 @@ def extract_document(doc):
                     if cl == 'lastRenderedPageBreak':
                         if not seen_text:
                             breaks_before_text += 1
-                        # mid-paragraph rendered break — still need to track for tables after
                     elif cl == 'br' and child.get(qn('w:type')) == 'page':
                         if seen_text:
                             breaks_after_text += 1
@@ -64,13 +63,12 @@ def extract_document(doc):
             current_page += breaks_after_text
 
         elif local == 'tbl':
-            # Split the table at every internal page break so each chunk
-            # gets the correct page number (fixes multi-page tables showing page 1).
-            chunk_start_page = current_page
-            chunk_rows = []
+            table_start_page = current_page
+            rows      = []
+            row_pages = []   # parallel to rows: page number for each row
 
             for tr in elem.iter(qn('w:tr')):
-                # Count page breaks that occur before any text in this row
+                # Count page breaks that appear before any text in this row
                 breaks_before = 0
                 seen_text_in_row = False
                 for run_elem in tr.iter(qn('w:r')):
@@ -78,29 +76,35 @@ def extract_document(doc):
                         cl = child.tag.split('}')[-1] if '}' in child.tag else child.tag
                         if cl == 'lastRenderedPageBreak' and not seen_text_in_row:
                             breaks_before += 1
-                        elif cl == 'br' and child.get(qn('w:type')) == 'page' and not seen_text_in_row:
+                        elif (cl == 'br' and child.get(qn('w:type')) == 'page'
+                              and not seen_text_in_row):
                             breaks_before += 1
                         elif cl == 't' and (child.text or '').strip():
                             seen_text_in_row = True
 
-                if breaks_before > 0:
-                    if chunk_rows:
-                        table_list.append((chunk_start_page, chunk_rows))
-                        chunk_rows = []
-                    current_page += breaks_before
-                    chunk_start_page = current_page
+                current_page += breaks_before   # advance before recording this row
 
                 cells = []
                 for tc in tr.iter(qn('w:tc')):
-                    cell_text = ''.join(n.text or '' for n in tc.iter(qn('w:t'))).strip()
+                    cell_text = ''.join(
+                        n.text or '' for n in tc.iter(qn('w:t'))).strip()
                     cells.append(cell_text)
                 if cells:
-                    chunk_rows.append(cells)
+                    rows.append(cells)
+                    row_pages.append(current_page)
 
-            if chunk_rows:
-                table_list.append((chunk_start_page, chunk_rows))
+            if rows:
+                table_list.append((table_start_page, rows, row_pages))
 
     return para_list, table_list
+
+
+def _tbl(entry):
+    """Unpack a table_list entry into (start_page, rows, row_pages)."""
+    if len(entry) == 3:
+        return entry
+    page, rows = entry
+    return page, rows, [page] * len(rows)
 
 
 def extract_pdf(file_bytes):
@@ -125,7 +129,7 @@ def extract_pdf(file_bytes):
                     if any(c for c in cells):
                         rows.append(cells)
                 if rows:
-                    table_list.append((page_num, rows))
+                    table_list.append((page_num, rows, [page_num] * len(rows)))
 
             # Extract text only from areas outside table bounding boxes
             # so table content doesn't appear twice in all_text.
@@ -160,9 +164,10 @@ def build_paged_text(para_list, table_list):
     by_page = {}
     for page, text in para_list:
         by_page.setdefault(page, []).append(text)
-    for page, rows in table_list:
-        for row in rows:
-            by_page.setdefault(page, []).append(' '.join(row))
+    for entry in table_list:
+        _, rows, row_pages = _tbl(entry)
+        for row, rp in zip(rows, row_pages):
+            by_page.setdefault(rp, []).append(' '.join(row))
 
     pieces = []
     boundaries = []  # (start_pos, page_num)
@@ -240,7 +245,8 @@ def find_table_by_header(table_list, *keywords):
     Searches the first 3 rows so tables with a merged group-header row above
     the actual column headers are still matched.
     """
-    for page, rows in table_list:
+    for entry in table_list:
+        page, rows, _ = _tbl(entry)
         if not rows:
             continue
         header = ' '.join(
@@ -292,7 +298,8 @@ def compact_formula_braces(txt):
 # ── document-type detection ───────────────────────────────────────────────────
 
 def detect_type(table_list, para_list):
-    for _page, rows in table_list:
+    for entry in table_list:
+        _, rows, _ = _tbl(entry)
         flat = ' '.join(c for row in rows for c in row)
         if '提案委員' in flat and '法規內容' in flat:
             return 'simplified'
@@ -331,27 +338,25 @@ def scan_tables_financial(table_list, unit):
     """
     found = {}
 
-    for page, rows in table_list:
+    for entry in table_list:
+        page, rows, row_pages = _tbl(entry)
         if not rows:
             continue
 
         table_flat = ' '.join(c for row in rows for c in row)
         unit_in_table = unit in table_flat
 
-        # Check whether this table has any tax-related keywords
         has_tax_kw = any(
             any(kw in table_flat for kw in kws)
             for _, kws in _KEYWORD_MAP
         )
 
-        # Skip tables with neither unit nor tax keywords
         if not unit_in_table and not has_tax_kw:
             continue
 
         header_text = ' '.join(rows[0]) if rows else ''
         unit_in_header = unit in header_text
 
-        # Identify the value column when unit is in the header
         val_col = None
         if unit_in_header:
             for ci, cell in enumerate(rows[0]):
@@ -442,12 +447,13 @@ def scan_tables_financial(table_list, unit):
             if val is None or val < 10:
                 continue
 
+            row_page = row_pages[ri] if ri < len(row_pages) else page
             # Map to tax item (first match per key wins)
             for key, kws in _KEYWORD_MAP:
                 if key in found:
                     continue
                 if any(kw in row_text for kw in kws):
-                    found[key] = (val, page)
+                    found[key] = (val, row_page)
                     break
 
     return found
@@ -496,7 +502,8 @@ def parse_full_report(table_list, para_list):
         p42, tbl42 = find_table_by_header(table_list, '降稅後稅率', '關稅')
     # Last resort: a table with multiple HS-code rows and a 合計 row
     if tbl42 is None:
-        for page, rows in table_list:
+        for entry in table_list:
+            page, rows, _ = _tbl(entry)
             hs_rows = [r for r in rows if r and re.match(r'\d{4}[\.\d]*', r[0].strip())]
             total_row = [r for r in rows if r and '合計' in r[0]]
             flat = ' '.join(c for r in rows for c in r)
@@ -524,7 +531,8 @@ def parse_full_report(table_list, para_list):
 
     # Identify formula tables
     formula_tables = {}
-    for page, rows in table_list:
+    for entry in table_list:
+        page, rows, _ = _tbl(entry)
         cell_text = '\n'.join(' '.join(row) for row in rows) if rows else ''
         ct = cell_text.replace(' ', '')
         if '汽車整車營利事業所得稅' in cell_text and '×15%' in ct:
@@ -683,7 +691,8 @@ def parse_simplified_summary_table(table_list):
     ]
 
     found = {}
-    for page, rows in table_list:
+    for entry in table_list:
+        page, rows, row_pages = _tbl(entry)
         # Locate the header row that marks the summary section
         header_ri = None
         for ri, row in enumerate(rows):
@@ -703,14 +712,14 @@ def parse_simplified_summary_table(table_list):
         if final_col is None:
             final_col = len(header_row) - 1
 
-        for row in rows[header_ri + 1:]:
+        for offset, row in enumerate(rows[header_ri + 1:]):
+            ri = header_ri + 1 + offset
             if not row:
                 continue
             label = row[0].strip()
             if not label:
                 continue
 
-            # Prefer the final_col; fall back to rightmost non-empty cell
             val_str = ''
             if final_col < len(row):
                 val_str = row[final_col].strip()
@@ -728,11 +737,12 @@ def parse_simplified_summary_table(table_list):
             except ValueError:
                 continue
 
+            row_page = row_pages[ri] if ri < len(row_pages) else page
             for key, labels in LABEL_MAP:
                 if key in found:
                     continue
                 if any(lbl in label for lbl in labels):
-                    found[key] = (abs(val), page)
+                    found[key] = (abs(val), row_page)
                     break
 
     return found
@@ -1329,7 +1339,10 @@ def main():
 
             label = '完整版報告（億元）' if doc_type == 'full' else '簡要格式報告（千元）'
             max_page = max((p for p, _ in para_list), default=1)
-            max_page = max(max_page, max((p for p, _ in table_list), default=1))
+            for entry in table_list:
+                _, _, rp = _tbl(entry)
+                if rp:
+                    max_page = max(max_page, max(rp))
             st.caption(f"識別類型：{label}　｜　格式：{file_fmt}　｜　表格數量：{len(table_list)}　｜　偵測頁數：第1～{max_page}頁")
 
             if doc_type == 'full':
