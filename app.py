@@ -90,12 +90,7 @@ def row_result(section, item, formula, reported, computed, diff, result, note):
 # ── formula text extraction ───────────────────────────────────────────────────
 
 def compact_formula_full(txt):
-    """
-    From a full-report single-cell formula table, extract the key calculation line.
-    Returns a compact string like '49億元×15%×20% = 1.47億元'.
-    """
     lines = [l.strip() for l in txt.replace('\r', '\n').split('\n') if l.strip()]
-    # Lines that start with '=' and contain × are the formula lines
     formula_line = next(
         (l.lstrip('= ').strip() for l in lines
          if l.startswith('=') and ('×' in l or 'x' in l.lower()) and '億元' in l),
@@ -115,7 +110,6 @@ def compact_formula_full(txt):
     return '  '.join(parts) if parts else txt[:120]
 
 def compact_formula_braces(txt):
-    """Extract the ｛〔...〕｝ formula block from simplified report text."""
     m = re.search(r'[｛{]\s*[〔\[].*?[〕\]].*?[｝}]', txt, re.DOTALL)
     if m:
         inner = m.group(0)
@@ -136,6 +130,72 @@ def detect_type(tables, paragraphs):
     if '簡要' in all_text or '提案委員' in all_text:
         return 'simplified'
     return 'full'
+
+# ── NEW: generic table financial scanner ──────────────────────────────────────
+
+# Priority-ordered keyword map: first match wins.
+# More specific keywords come first to avoid false positives.
+_KEYWORD_MAP = [
+    ('total_cit',   ['營利事業所得稅合計', '三項合計']),
+    ('vehicle_cit', ['整車業增加稅額', '汽車整車', '整車業', '整車']),
+    ('parts_cit',   ['零組件業增加稅額', '汽車零組件', '零組件']),
+    ('other_cit',   ['其他工業及服務業', '其他工業']),
+    ('tariff_loss', ['關稅損失', '最初收入損失', '關稅收入減少']),
+    ('commodity',   ['貨物稅增加', '貨物稅']),
+    ('vat',         ['加值型營業稅增加', '加值型營業稅']),
+    ('personal',    ['個人綜合所得稅', '員工個人所得稅', '薪資所得稅']),
+    ('dividend',    ['股東個人股利所得稅', '股利所得稅']),
+    ('net',         ['稅收淨損益', '淨損益', '最終稅收淨', '稅收淨']),
+]
+
+
+def scan_tables_financial(tables, unit):
+    """
+    Scan every table cell-row for financial figures expressed in `unit` (千元 or 億元).
+    Skips rows that look like formula rows (contain × ＋ or mid-row =).
+    Returns dict: {item_key: value} using first-match per key.
+    """
+    found = {}
+
+    for rows in tables:
+        for row in rows:
+            row_text = ' '.join(c.strip() for c in row if c.strip())
+            if not row_text:
+                continue
+
+            # Skip header rows and formula-text rows
+            if any(sym in row_text for sym in ('×', '＋', '÷')) and '=' in row_text:
+                continue
+            if '稅率' in row_text and '%' in row_text and unit not in row_text:
+                continue
+
+            # Extract numeric value associated with the unit
+            nums_with_unit = re.findall(r'([\d,]+(?:\.\d+)?)\s*' + re.escape(unit), row_text)
+            if not nums_with_unit:
+                # For tables where the unit is in the header, try last column
+                last_cell = row[-1].strip() if row else ''
+                nums_plain = re.findall(r'(?<![%\d])([\d,]{4,})(?!\d)', last_cell)
+                if not nums_plain:
+                    continue
+                nums_with_unit = [nums_plain[-1]]
+
+            try:
+                val = float(nums_with_unit[-1].replace(',', ''))
+            except (ValueError, IndexError):
+                continue
+            if val < 10:
+                continue
+
+            # Match to known tax item (first match wins per key)
+            for key, kws in _KEYWORD_MAP:
+                if key in found:
+                    continue
+                if any(kw in row_text for kw in kws):
+                    found[key] = val
+                    break
+
+    return found
+
 
 # ── full-format parser ────────────────────────────────────────────────────────
 
@@ -208,7 +268,6 @@ def parse_full_report(tables, paragraphs):
 
     data['formula_tables'] = formula_tables
 
-    # Extract values + formula strings from each formula table
     formulas = {}
 
     def get_txt(key):
@@ -281,6 +340,10 @@ def parse_full_report(tables, paragraphs):
     data['net_reported'] = float(m.group(1).replace(' ', '')) if m else 0.29
 
     data['formulas'] = formulas
+
+    # Scan all tables for financial values (億元) — independent cross-check
+    data['table_values'] = scan_tables_financial(tables, '億元')
+
     return data
 
 
@@ -337,58 +400,55 @@ def parse_simplified_report(tables, paragraphs):
     data['net_reported_k']          = find_k(r'稅收淨收入([\d,]+)千元') or find_k(r'最終稅收.*?([\d,]+)千元')
     data['other_profit_k']          = find_k(r'增加產值利潤([\d,]+)千元')
 
-    # Extract formula text blocks
+    # Formula text blocks
     formulas = {}
     vo_k = data.get('vehicle_output_k') or 4900813
     po_k = data.get('parts_output_k') or 3430569
 
-    # Vehicle CIT formula: search near "整車業增加稅額"
     m = re.search(r'整車業增加稅額約為新臺幣[\d,]+千元([^。\n]{0,300})', all_text, re.DOTALL)
     formulas['vehicle_cit'] = (compact_formula_braces(m.group(0)) if m else
                                 f'{fmt(vo_k,0)}千元 × 15% × 20%')
 
-    # Parts CIT formula
     m = re.search(r'國產化比例約?70%[^。]{0,400}增加稅額約為新臺幣[\d,]+千元([^。]{0,300})', all_text, re.DOTALL)
     formulas['parts_cit'] = (compact_formula_braces(m.group(0)) if m else
                               f'{fmt(po_k,0)}千元 × 13% × 20%')
 
-    # Other CIT formula
     m = re.search(r'兩者合計[\d,]+千元[，,]([^。]{0,300}新臺幣[\d,]+千元)', all_text, re.DOTALL)
     if not m:
         m = re.search(r'就其他工業及服務業部分[^。]{0,500}新臺幣[\d,]+千元([^。]{0,200})', all_text, re.DOTALL)
     formulas['other_cit'] = compact_formula_braces(m.group(0)) if m else '3,844,451千元 × 20%'
 
-    # Commodity tax formula
     m = re.search(r'貨物稅增加額約為新臺幣[\d,]+千元([^。]{0,500})', all_text, re.DOTALL)
     formulas['commodity'] = compact_formula_braces(m.group(0)) if m else ''
 
-    # VAT formula
     m = re.search(r'加值型營業稅增加額約為新臺幣[\d,]+千元([^。\n]{0,500})', all_text, re.DOTALL)
     formulas['vat'] = compact_formula_braces(m.group(0)) if m else ''
 
-    # Personal tax formula (show the formula in braces from the text)
     m = re.search(r'員工個人所得稅增加額約為新臺幣[\d,]+千元([^。]{0,400})', all_text, re.DOTALL)
     formulas['personal'] = compact_formula_braces(m.group(0)) if m else ''
 
-    # Dividend formula
     m = re.search(r'股東個人股利所得稅增加額約為新臺幣[\d,]+千元([^。]{0,400})', all_text, re.DOTALL)
     formulas['dividend'] = compact_formula_braces(m.group(0)) if m else ''
 
     data['formulas'] = formulas
     data['all_text'] = all_text
+
+    # Scan all tables for financial values (千元) — independent cross-check
+    data['table_values'] = scan_tables_financial(tables, '千元')
+
     return data
 
 
 # ── verification: full report ─────────────────────────────────────────────────
 
 SEC_TARIFF  = '一、最初收入損失法'
-SEC_FINAL   = '二、最終收入損失法'
 SEC_CT      = '　（一）貨物稅'
 SEC_VAT     = '　（二）加值型營業稅'
 SEC_CIT     = '　（三）營利事業所得稅'
 SEC_PER     = '　（四）個人綜合所得稅'
 SEC_DIV     = '　（五）股東個人股利所得稅'
 SEC_NET     = '三、淨損益'
+SEC_TBL     = '附：表格數值核對'
 
 
 def verify_full(data):
@@ -398,7 +458,6 @@ def verify_full(data):
 
     # ── 最初收入損失法 ───────────────────────────────────────────────────────
 
-    # Import total
     if items:
         calc_total = round2(sum(it['import_5yr'] for it in items))
         rep = data.get('total_import_reported') or 147.86
@@ -407,7 +466,6 @@ def verify_full(data):
             fmt(rep), fmt(calc_total), fmt(rep - calc_total),
             status_icon(ok(rep, calc_total)), ''))
 
-    # Simple average rate
     if items and all(it['current_rate'] is not None for it in items):
         calc_wavg = sum(it['current_rate'] for it in items) / len(items)
         rep_wavg = data.get('weighted_rate_reported') or 0.1185
@@ -418,26 +476,24 @@ def verify_full(data):
             f'{(rep_wavg-calc_wavg)*100:.4f}%',
             status_icon(ok(rep_wavg, calc_wavg, tol=0.005)), ''))
 
-    # Per-item tariff loss
     calc_total_loss = 0
     for it in items:
         if it['import_5yr'] is None or it['current_rate'] is None or it['after_rate'] is None:
             continue
         cut = it['current_rate'] - it['after_rate']
         calc_loss = round2(it['import_5yr'] * cut)
-        rep_loss  = data.get('item_losses_reported', {}).get(it['hs'])
+        rep_loss_item = data.get('item_losses_reported', {}).get(it['hs'])
         calc_total_loss += calc_loss
         results.append(row_result(
             SEC_TARIFF,
             f"{it['hs']}　{it['name'][:14]}",
             f"{it['import_5yr']} × {cut*100:.1f}%",
-            fmt(rep_loss) if rep_loss else '—',
+            fmt(rep_loss_item) if rep_loss_item else '—',
             fmt(calc_loss),
-            fmt(rep_loss - calc_loss) if rep_loss else '—',
-            status_icon(ok(rep_loss, calc_loss)) if rep_loss else '⚠️',
+            fmt(rep_loss_item - calc_loss) if rep_loss_item else '—',
+            status_icon(ok(rep_loss_item, calc_loss)) if rep_loss_item else '⚠️',
             '關稅損失(億元)'))
 
-    # Total tariff loss
     rep_loss = data.get('tariff_loss_reported') or 22.40
     results.append(row_result(
         SEC_TARIFF, '關稅損失合計 (億元)', 'Σ各品項關稅損失',
@@ -530,10 +586,48 @@ def verify_full(data):
     rep_net  = data.get('net_reported', 0.29)
     results.append(row_result(
         SEC_NET, '最終收入損失法淨損益 (億元)',
-        f'CIT+股利+個人+貨物稅+營業稅－關稅損失',
+        'CIT+股利+個人+貨物稅+營業稅－關稅損失',
         fmt(rep_net), fmt(calc_net), fmt(rep_net - calc_net),
         status_icon(ok(rep_net, calc_net, tol=0.10)),
         f'{fmt(calc_tcit)}+{fmt(rep_div)}+{fmt(rep_per)}+{fmt(calc_ct)}+{fmt(calc_vat)}−{fmt(rep_loss)}'))
+
+    # ── 附：表格數值核對 ──────────────────────────────────────────────────────
+    tv = data.get('table_values', {})
+    tbl_checks = [
+        ('tariff_loss', '表格：關稅損失 (億元)',   rep_loss,  calc_total_loss),
+        ('commodity',   '表格：貨物稅 (億元)',      rep_ct,    calc_ct),
+        ('vat',         '表格：加值型營業稅 (億元)', rep_vat,   calc_vat),
+        ('vehicle_cit', '表格：整車CIT (億元)',     rep_vcit,  calc_vcit),
+        ('parts_cit',   '表格：零組件CIT (億元)',   rep_pcit,  calc_pcit),
+        ('other_cit',   '表格：其他CIT (億元)',     rep_ocit,  calc_ocit),
+        ('total_cit',   '表格：CIT合計 (億元)',     rep_tcit,  calc_tcit),
+        ('net',         '表格：淨損益 (億元)',       rep_net,   calc_net),
+    ]
+    tbl_rows_added = 0
+    for key, label, formula_rep, formula_calc in tbl_checks:
+        if key not in tv:
+            continue
+        tbl_val = tv[key]
+        # Compare table cell value vs formula-computed value
+        diff_tc = round2(tbl_val - formula_calc) if formula_calc is not None else None
+        note = f'表格讀取={fmt(tbl_val)}，公式計算={fmt(formula_calc)}'
+        if formula_rep is not None:
+            diff_tr = round2(tbl_val - formula_rep)
+            note += f'，公式文字={fmt(formula_rep)}'
+            passed = ok(tbl_val, formula_calc) and ok(tbl_val, formula_rep)
+        else:
+            passed = ok(tbl_val, formula_calc)
+        results.append(row_result(
+            SEC_TBL, label, '（來自表格欄位）',
+            fmt(tbl_val), fmt(formula_calc) if formula_calc else '—',
+            fmt(diff_tc) if diff_tc is not None else '—',
+            status_icon(passed), note))
+        tbl_rows_added += 1
+
+    if tbl_rows_added == 0:
+        results.append(row_result(
+            SEC_TBL, '（未偵測到獨立彙總表格）', '',
+            '—', '—', '—', '⚠️', '若文件含有獨立彙總結果表，請確認表格關鍵字'))
 
     return pd.DataFrame(results)
 
@@ -653,163 +747,105 @@ def verify_simplified(data):
         status_icon(ok(rep_net, calc_net, tol=0.05)),
         f'{fmt(calc_tcit,0)}+{fmt(rep_div,0)}+{fmt(rep_per,0)}+{fmt(calc_ct,0)}+{fmt(calc_vat,0)}−{fmt(rep_loss,0)}'))
 
+    # ── 附：表格數值核對 ──────────────────────────────────────────────────────
+    tv = data.get('table_values', {})
+    tbl_checks = [
+        ('tariff_loss', '表格：關稅損失 (千元)',          rep_loss,  None),
+        ('commodity',   '表格：貨物稅 (千元)',             rep_ct,    calc_ct),
+        ('vat',         '表格：加值型營業稅 (千元)',        rep_vat,   calc_vat),
+        ('vehicle_cit', '表格：整車CIT (千元)',            rep_vcit,  calc_vcit),
+        ('parts_cit',   '表格：零組件CIT (千元)',          rep_pcit,  calc_pcit),
+        ('other_cit',   '表格：其他CIT (千元)',            rep_ocit,  calc_ocit),
+        ('total_cit',   '表格：CIT合計 (千元)',            rep_tcit,  calc_tcit),
+        ('net',         '表格：淨損益 (千元)',              rep_net,   calc_net),
+    ]
+    tbl_rows_added = 0
+    for key, label, text_rep, formula_calc in tbl_checks:
+        if key not in tv:
+            continue
+        tbl_val = tv[key]
+        calc_ref = formula_calc if formula_calc is not None else text_rep
+        diff_tc = round2(tbl_val - calc_ref) if calc_ref is not None else None
+        note = f'表格讀取={fmt(tbl_val, 0)}'
+        if text_rep is not None:
+            note += f'，文字萃取={fmt(text_rep, 0)}'
+            passed = ok(tbl_val, text_rep) and (formula_calc is None or ok(tbl_val, formula_calc))
+        else:
+            passed = ok(tbl_val, formula_calc) if formula_calc else None
+        results.append(row_result(
+            SEC_TBL, label, '（來自表格欄位）',
+            fmt(tbl_val, 0),
+            fmt(formula_calc, 0) if formula_calc is not None else '（引用）',
+            fmt(diff_tc, 0) if diff_tc is not None else '—',
+            status_icon(passed), note))
+        tbl_rows_added += 1
+
+    if tbl_rows_added == 0:
+        results.append(row_result(
+            SEC_TBL, '（未偵測到表格中的千元數值）', '',
+            '—', '—', '—', '⚠️', '若文件含有結果表格，請確認表格格式'))
+
     return pd.DataFrame(results)
 
 
-# ── cross-file comparison ─────────────────────────────────────────────────────
-
-def cross_compare(full_data, simp_data, full_df, simp_df):
-    """
-    Compare corresponding values between full (億元) and simplified (千元) reports.
-    1億元 = 100,000千元.
-    """
-    SCALE = 100000  # 億元 → 千元
-
-    def full_v(key, default=None):
-        return full_data.get(key, default)
-
-    def simp_v(key, default=None):
-        return simp_data.get(key, default)
-
-    rows = []
-    pairs = [
-        ('5年平均進口總額',
-         '億元', full_v('total_import_reported', 147.86),
-         '千元', simp_v('total_import_reported_k', 14785668)),
-        ('關稅損失（最初收入損失法）',
-         '億元', full_v('tariff_loss_reported', 22.40),
-         '千元', simp_v('tariff_loss_reported_k', 2240360)),
-        ('整車產值增加額',
-         '億元', full_v('vehicle_output', 49.0),
-         '千元', simp_v('vehicle_output_k', 4900813)),
-        ('零組件產值增加額',
-         '億元', full_v('parts_output', 34.31),
-         '千元', simp_v('parts_output_k', 3430569)),
-        ('整車營利事業所得稅',
-         '億元', full_v('vehicle_cit_reported'),
-         '千元', simp_v('vehicle_cit_reported_k')),
-        ('零組件營利事業所得稅',
-         '億元', full_v('parts_cit_reported'),
-         '千元', simp_v('parts_cit_reported_k')),
-        ('其他工業及服務業所得稅',
-         '億元', full_v('other_cit_reported'),
-         '千元', simp_v('other_cit_reported_k')),
-        ('貨物稅',
-         '億元', full_v('commodity_tax_reported'),
-         '千元', simp_v('commodity_tax_reported_k')),
-        ('加值型營業稅',
-         '億元', full_v('vat_reported'),
-         '千元', simp_v('vat_reported_k')),
-        ('最終淨損益',
-         '億元', full_v('net_reported', 0.29),
-         '千元', simp_v('net_reported_k', 29231)),
-    ]
-
-    for label, u1, v1, u2, v2 in pairs:
-        if v1 is None or v2 is None:
-            rows.append({'項目': label, f'完整版({u1})': fmt(v1) if v1 else '—',
-                         f'簡要格式({u2})': fmt(v2, 0) if v2 else '—',
-                         '換算差異(千元)': '—', '結果': '⚠️'})
-            continue
-        v1_k = round2(v1 * SCALE)
-        diff = round2(v2 - v1_k)
-        passed = abs(diff) / max(abs(v2), 1) <= 0.01  # 1% tolerance
-        rows.append({
-            '項目': label,
-            f'完整版({u1})': fmt(v1),
-            f'簡要格式({u2})': fmt(v2, 0),
-            '換算差異(千元)': fmt(diff, 0),
-            '結果': status_icon(passed),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# ── Excel export ──────────────────────────────────────────────────────────────
-
-SECTION_KEYS = [SEC_TARIFF, SEC_FINAL, SEC_CT, SEC_VAT, SEC_CIT, SEC_PER, SEC_DIV, SEC_NET]
+# ── Excel export (single file) ────────────────────────────────────────────────
 
 FILL_GREEN   = PatternFill('solid', fgColor='C6EFCE')
 FILL_RED     = PatternFill('solid', fgColor='FFC7CE')
 FILL_YELLOW  = PatternFill('solid', fgColor='FFEB9C')
 FILL_HEADER  = PatternFill('solid', fgColor='4472C4')
 FILL_SECTION = PatternFill('solid', fgColor='D9E1F2')
+FILL_TBL     = PatternFill('solid', fgColor='E2EFDA')
 FONT_WHITE   = Font(color='FFFFFF', bold=True)
 FONT_SECTION = Font(bold=True, color='1F3864')
 THIN         = Side(style='thin')
 BORDER       = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-def to_excel(df_list, sheet_names, compare_df=None):
+def to_excel_single(df, title):
     wb = Workbook()
-    wb.remove(wb.active)
+    ws = wb.active
+    ws.title = title[:31]
 
-    for df, name in zip(df_list, sheet_names):
-        ws = wb.create_sheet(title=name[:31])
-        headers = list(df.columns)
-        ws.append(headers)
-        for ci, _ in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=ci)
-            cell.fill = FILL_HEADER
-            cell.font = FONT_WHITE
-            cell.alignment = Alignment(horizontal='center', wrap_text=True)
+    headers = list(df.columns)
+    ws.append(headers)
+    for ci, _ in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=ci)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_WHITE
+        cell.alignment = Alignment(horizontal='center', wrap_text=True)
+        cell.border = BORDER
+
+    current_section = None
+    ri = 2
+    for _, row_data in df.iterrows():
+        sec = row_data.get('章節', '')
+        if sec and sec != current_section:
+            current_section = sec
+            ws.merge_cells(start_row=ri, start_column=1,
+                           end_row=ri, end_column=len(headers))
+            cell = ws.cell(row=ri, column=1, value=sec)
+            cell.fill = FILL_TBL if sec == SEC_TBL else FILL_SECTION
+            cell.font = FONT_SECTION
+            cell.alignment = Alignment(horizontal='left')
             cell.border = BORDER
-
-        current_section = None
-        ri = 2
-        for _, row_data in df.iterrows():
-            sec = row_data.get('章節', '')
-            if sec and sec != current_section:
-                current_section = sec
-                ws.merge_cells(start_row=ri, start_column=1,
-                                end_row=ri, end_column=len(headers))
-                cell = ws.cell(row=ri, column=1, value=sec)
-                cell.fill = FILL_SECTION
-                cell.font = FONT_SECTION
-                cell.alignment = Alignment(horizontal='left')
-                cell.border = BORDER
-                ri += 1
-
-            result_val = str(row_data.get('結果', ''))
-            fill = (FILL_GREEN if '✅' in result_val
-                    else FILL_RED if '❌' in result_val
-                    else FILL_YELLOW)
-            for ci, col in enumerate(headers, 1):
-                val = row_data[col]
-                cell = ws.cell(row=ri, column=ci, value=val)
-                cell.alignment = Alignment(wrap_text=True, vertical='top')
-                cell.border = BORDER
-                cell.fill = fill
             ri += 1
 
-        for col in ws.columns:
-            max_len = max((len(str(c.value or '')) for c in col), default=0)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 60)
-
-    # Cross-file comparison sheet
-    if compare_df is not None:
-        ws = wb.create_sheet(title='兩份報告比較')
-        headers = list(compare_df.columns)
-        ws.append(headers)
-        for ci, _ in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=ci)
-            cell.fill = FILL_HEADER
-            cell.font = FONT_WHITE
-            cell.alignment = Alignment(horizontal='center')
+        result_val = str(row_data.get('結果', ''))
+        fill = (FILL_GREEN if '✅' in result_val
+                else FILL_RED if '❌' in result_val
+                else FILL_YELLOW)
+        for ci, col in enumerate(headers, 1):
+            val = row_data[col]
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.alignment = Alignment(wrap_text=True, vertical='top')
             cell.border = BORDER
-        for ri, (_, row_data) in enumerate(compare_df.iterrows(), 2):
-            result_val = str(row_data.get('結果', ''))
-            fill = (FILL_GREEN if '✅' in result_val
-                    else FILL_RED if '❌' in result_val
-                    else FILL_YELLOW)
-            for ci, col in enumerate(headers, 1):
-                cell = ws.cell(row=ri, column=ci, value=row_data[col])
-                cell.alignment = Alignment(wrap_text=True, vertical='top')
-                cell.border = BORDER
-                cell.fill = fill
-        for col in ws.columns:
-            max_len = max((len(str(c.value or '')) for c in col), default=0)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 40)
+            cell.fill = fill
+        ri += 1
+
+    for col in ws.columns:
+        max_len = max((len(str(c.value or '')) for c in col), default=0)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 60)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -821,42 +857,37 @@ def to_excel(df_list, sheet_names, compare_df=None):
 
 def main():
     st.title("📋 稅式支出評估報告驗證工具")
-    st.markdown("上傳 Word 報告（完整版 F2 或簡要格式），自動驗證所有計算，並匯出 Excel 驗證報告。")
+    st.markdown("上傳 Word 報告（完整版 F2 或簡要格式），自動驗證所有計算，並匯出各份 Excel 驗證報告。")
 
     uploaded_files = st.file_uploader(
-        "選擇 Word 檔案（可同時上傳兩份）",
+        "選擇 Word 檔案（可一次上傳多份）",
         type=['docx'],
         accept_multiple_files=True,
-        help="支援完整版報告與簡要格式報告",
+        help="支援完整版報告（億元）與簡要格式報告（千元），可同時上傳多份分別驗證",
     )
 
     if not uploaded_files:
         st.markdown("""
 **支援格式：**
 - **完整版報告**（如「汽車零組件關稅調降稅式支出評估報告」.F2.docx）
-  - 驗證：進口基準值、各品項關稅損失、各稅目公式、最終淨損益
+  - 驗證：進口基準值、各品項關稅損失（表4-1/4-2）、各稅目公式計算、表格數值核對、最終淨損益
 - **簡要格式報告**（如「稅式支出評估報告(簡要格式)」.F2.docx）
-  - 驗證：千元單位下各稅目公式計算
+  - 驗證：千元單位下各稅目公式計算、表格數值核對
 
-同時上傳兩份時，另產生**兩份報告比對**工作表，驗證數字一致性。
+每份檔案分別產生一份 Excel 驗證報告供下載。
         """)
         return
 
-    all_dfs   = []
-    all_names = []
-    all_data  = {}   # 'full' or 'simplified' → parsed data dict
-    all_types = {}
-
     for uploaded_file in uploaded_files:
+        st.divider()
         st.subheader(f"📄 {uploaded_file.name}")
         try:
             doc        = Document(io.BytesIO(uploaded_file.read()))
             tables     = extract_tables(doc)
             paragraphs = extract_paragraphs(doc)
             doc_type   = detect_type(tables, paragraphs)
-            all_types[uploaded_file.name] = doc_type
 
-            label = '完整版報告' if doc_type == 'full' else '簡要格式報告'
+            label = '完整版報告（億元）' if doc_type == 'full' else '簡要格式報告（千元）'
             st.caption(f"識別類型：{label}　｜　表格數量：{len(tables)}")
 
             if doc_type == 'full':
@@ -865,8 +896,6 @@ def main():
             else:
                 data = parse_simplified_report(tables, paragraphs)
                 df   = verify_simplified(data)
-
-            all_data[doc_type] = data
 
             # Summary metrics
             total  = len(df)
@@ -879,9 +908,7 @@ def main():
             c3.metric("❌ 有誤", failed)
             c4.metric("⚠️ 待確認", warn)
 
-            # Color-coded table (hide 章節 column from display—used for grouping)
             display_cols = [c for c in df.columns if c != '章節']
-            display_df   = df[display_cols]
 
             def highlight(row):
                 color = ('#C6EFCE' if row['結果'] == '✅'
@@ -889,14 +916,14 @@ def main():
                          else '#FFEB9C')
                 return [f'background-color: {color}'] * len(row)
 
-            # Group by section for display
+            # Group by section
             for sec, group in df.groupby('章節', sort=False):
                 st.markdown(f"**{sec}**")
                 g = group[display_cols].reset_index(drop=True)
                 st.dataframe(g.style.apply(highlight, axis=1),
                              use_container_width=True, hide_index=True)
 
-            # Item-level detail for full report
+            # Per-item tariff table (full report only)
             if doc_type == 'full' and data.get('items'):
                 with st.expander("展開：各品項明細表（表4-1）"):
                     item_df = pd.DataFrame(data['items'])
@@ -905,46 +932,38 @@ def main():
                             lambda r: round2(r['import_5yr'] * (r['current_rate'] - r['after_rate']))
                             if r['current_rate'] is not None and r['after_rate'] is not None else None,
                             axis=1)
-                        item_df.columns = ['稅則號別','貨名','5年平均進口(億元)','現行稅率','降稅後稅率','計算關稅損失(億元)']
+                        item_df.columns = ['稅則號別', '貨名', '5年平均進口(億元)',
+                                           '現行稅率', '降稅後稅率', '計算關稅損失(億元)']
                         st.dataframe(item_df, use_container_width=True, hide_index=True)
 
-            short = uploaded_file.name[:28].replace('.docx','').replace('「','').replace('」','')
-            all_dfs.append(df)
-            all_names.append(short)
+            # Debug: show which table values were detected
+            tv = data.get('table_values', {})
+            if tv:
+                with st.expander(f"展開：偵測到的表格數值（共 {len(tv)} 項）"):
+                    unit = '億元' if doc_type == 'full' else '千元'
+                    tv_df = pd.DataFrame([
+                        {'稅目鍵值': k, f'表格讀取值（{unit}）': fmt(v, 0 if unit == '千元' else 2)}
+                        for k, v in tv.items()
+                    ])
+                    st.dataframe(tv_df, use_container_width=True, hide_index=True)
+
+            # Per-file Excel download
+            short = (uploaded_file.name
+                     .replace('.docx', '')
+                     .replace('「', '').replace('」', '')
+                     [:30])
+            excel_buf = to_excel_single(df, short)
+            st.download_button(
+                label=f"📥 下載 Excel：{short[:25]}…" if len(short) > 25 else f"📥 下載 Excel：{short}",
+                data=excel_buf,
+                file_name=f"{short}_驗證結果.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_{uploaded_file.name}",
+            )
 
         except Exception as e:
             st.error(f"解析失敗：{e}")
             st.exception(e)
-
-    # Cross-file comparison (when both types present)
-    compare_df = None
-    if 'full' in all_data and 'simplified' in all_data:
-        st.divider()
-        st.subheader("📊 兩份報告比對")
-        st.caption("完整版（億元）換算為千元（×100,000）後與簡要格式比對，容差 1%")
-        full_df = all_dfs[[i for i, n in enumerate(all_names) if all_types.get(n+'簡') == 'full' or True][0]]
-        simp_df = all_dfs[-1] if len(all_dfs) > 1 else all_dfs[0]
-        compare_df = cross_compare(all_data['full'], all_data['simplified'], full_df, simp_df)
-
-        def highlight_cmp(row):
-            color = ('#C6EFCE' if row['結果'] == '✅'
-                     else '#FFC7CE' if row['結果'] == '❌'
-                     else '#FFEB9C')
-            return [f'background-color: {color}'] * len(row)
-
-        st.dataframe(compare_df.style.apply(highlight_cmp, axis=1),
-                     use_container_width=True, hide_index=True)
-
-    # Excel download
-    if all_dfs:
-        st.divider()
-        excel_buf = to_excel(all_dfs, all_names, compare_df)
-        st.download_button(
-            label="📥 下載 Excel 驗證報告",
-            data=excel_buf,
-            file_name="稅式支出驗證結果.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
 
 
 if __name__ == '__main__':
