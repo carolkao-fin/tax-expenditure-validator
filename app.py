@@ -1422,19 +1422,6 @@ def main():
                     ])
                     st.dataframe(tv_df, use_container_width=True, hide_index=True)
 
-            with st.expander(f"🔍 診斷：文件所有表格（共 {len(table_list)} 個）"):
-                for ti, entry in enumerate(table_list):
-                    pg, rows, rp = _tbl(entry)
-                    pages_range = f"第{min(rp)}～{max(rp)}頁" if rp else f"第{pg}頁"
-                    st.markdown(f"**表格 #{ti+1}**　{pages_range}　共 {len(rows)} 列")
-                    preview = rows[:4]
-                    if preview:
-                        st.dataframe(
-                            pd.DataFrame(preview),
-                            use_container_width=True, hide_index=True)
-                if doc_type == 'full':
-                    ft = data.get('formula_tables', {})
-                    st.markdown(f"**識別到的公式表格：** {list(ft.keys()) or '（無）'}")
 
             short = (uploaded_file.name
                      .replace('.docx', '')
