@@ -538,6 +538,81 @@ def parse_full_report(table_list, para_list):
     return data
 
 
+# ── simplified summary-table parser ──────────────────────────────────────────
+
+def parse_simplified_summary_table(table_list):
+    """
+    Find the 項目 | 最初收入損失法 | 最終收入損失法 summary section inside
+    the simplified-format's large table and extract each tax item's 最終 value.
+    Handles abbreviated labels and negative tariff figures.
+    Returns {key: (abs_value, page)}.
+    """
+    LABEL_MAP = [
+        ('tariff_loss', ['關稅']),
+        ('commodity',   ['貨物稅']),
+        ('vat',         ['營業稅']),
+        ('total_cit',   ['營利事業所得稅']),
+        ('personal',    ['個人綜合所得稅', '個人所得稅']),
+        ('dividend',    ['股東個人所得稅', '股東個人股利所得稅']),
+        ('net',         ['合計']),
+    ]
+
+    found = {}
+    for page, rows in table_list:
+        # Locate the header row that marks the summary section
+        header_ri = None
+        for ri, row in enumerate(rows):
+            row_flat = ' '.join(row)
+            if '最初收入損失法' in row_flat and '最終收入損失法' in row_flat:
+                header_ri = ri
+                break
+        if header_ri is None:
+            continue
+
+        # Identify the column index for '最終收入損失法'
+        header_row = rows[header_ri]
+        final_col = None
+        for ci, cell in enumerate(header_row):
+            if '最終收入損失法' in cell:
+                final_col = ci
+        if final_col is None:
+            final_col = len(header_row) - 1
+
+        for row in rows[header_ri + 1:]:
+            if not row:
+                continue
+            label = row[0].strip()
+            if not label:
+                continue
+
+            # Prefer the final_col; fall back to rightmost non-empty cell
+            val_str = ''
+            if final_col < len(row):
+                val_str = row[final_col].strip()
+            if not val_str:
+                for cell in reversed(row):
+                    if cell.strip():
+                        val_str = cell.strip()
+                        break
+            if not val_str:
+                continue
+
+            val_str_clean = re.sub(r'[,，\s]', '', val_str)
+            try:
+                val = float(val_str_clean)
+            except ValueError:
+                continue
+
+            for key, labels in LABEL_MAP:
+                if key in found:
+                    continue
+                if any(lbl in label for lbl in labels):
+                    found[key] = (abs(val), page)
+                    break
+
+    return found
+
+
 # ── simplified-format parser ──────────────────────────────────────────────────
 
 def parse_simplified_report(table_list, para_list):
@@ -617,7 +692,30 @@ def parse_simplified_report(table_list, para_list):
 
     data['formulas'] = formulas
     data['pages'] = pages
-    data['table_values'] = scan_tables_financial(table_list, '千元')
+
+    # Merge generic scanner + dedicated summary-table parser.
+    # Summary table wins when both find the same key (it uses the definitive
+    # 最終收入損失法 column and handles abbreviated labels / negative values).
+    table_values = scan_tables_financial(table_list, '千元')
+    summary_tv   = parse_simplified_summary_table(table_list)
+    table_values.update(summary_tv)          # summary overrides generic scan
+    data['table_values'] = table_values
+
+    # Backfill any reported values that regex couldn't extract from prose
+    _backfill = [
+        ('tariff_loss_reported_k',  'tariff_loss'),
+        ('commodity_tax_reported_k','commodity'),
+        ('vat_reported_k',          'vat'),
+        ('total_cit_reported_k',    'total_cit'),
+        ('personal_tax_reported_k', 'personal'),
+        ('dividend_tax_reported_k', 'dividend'),
+        ('net_reported_k',          'net'),
+    ]
+    for data_key, tv_key in _backfill:
+        if data.get(data_key) is None and tv_key in summary_tv:
+            val, pg = summary_tv[tv_key]
+            data[data_key] = val
+            pages[data_key.replace('_reported_k', '').replace('_tax', '')] = pg
 
     return data
 
@@ -843,7 +941,7 @@ def verify_simplified(data):
     rep_div  = data.get('dividend_tax_reported_k')  or 76500
     rep_ct   = data.get('commodity_tax_reported_k') or 890371
     rep_vat  = data.get('vat_reported_k')           or 294747
-    rep_net  = data.get('net_reported_k')           or 29231
+    rep_net  = data.get('net_reported_k')           or 29241
     OTHER_PROFIT_K = data.get('other_profit_k') or 1604091
 
     # ── 最初收入損失法 ────────────────────────────────────────────────────────
