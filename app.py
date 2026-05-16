@@ -204,7 +204,8 @@ def compact_formula_full(txt):
         (l.lstrip('= ').strip() for l in lines
          if l.startswith('=') and ('×' in l or 'x' in l.lower()) and '億元' in l),
         None)
-    result_line = next((l for l in lines if '新臺幣' in l and '億元' in l), None)
+    # Use the LAST matching line so multi-part formulas show the total, not a sub-total
+    result_line = next((l for l in reversed(lines) if '新臺幣' in l and '億元' in l), None)
     parts = []
     if formula_line:
         parts.append(formula_line)
@@ -564,19 +565,21 @@ def parse_full_report(table_list, paragraphs):
         if m_profit: div_params['profit']        = float(m_profit.group(1))
     data['dividend_params'] = div_params
 
+    # Document uses '員工個人所得稅' (not '個人綜合所得稅') as the section heading
     m = re.search(
-        r'個人綜合所得稅[^。\n]{0,200}新臺幣\s*([\d\.]+)\s*億元',
+        r'(?:員工個人所得稅|個人綜合所得稅)[^。\n]{0,200}新臺幣\s*([\d\.]+)\s*億元',
         all_paras, re.DOTALL)
     per_text_val_yi = float(m.group(1)) if m else None
     if not per_text_val_yi:
         m = re.search(
-            r'個人綜合所得稅[^。\n]{0,200}新臺幣\s*([\d,]+)\s*萬元', all_paras)
+            r'(?:員工個人所得稅|個人綜合所得稅)[^。\n]{0,200}新臺幣\s*([\d,]+)\s*萬元', all_paras)
         per_text_val_yi = float(m.group(1).replace(',', '')) / 10000 if m else None
 
     txt = get_txt('personal')
-    m = re.search(r'合計\s*=\s*([\d\.]+)\s*萬元', txt)
+    m = re.search(r'合計\s*=\s*(?:新臺幣)?\s*([\d\.]+)\s*萬元', txt)
     if not m:
-        vals = re.findall(r'=\s*([\d\.]+)\s*萬元', txt)
+        # Allow '新臺幣' between '=' and the number (e.g. '= 新臺幣287.4萬元')
+        vals = re.findall(r'=\s*(?:新臺幣)?\s*([\d\.]+)\s*萬元', txt)
         per_formula_val = float(vals[-1]) / 10000 if vals else None
     else:
         per_formula_val = float(m.group(1)) / 10000
