@@ -16,20 +16,33 @@ def extract_document(doc):
     """
     Walk the document body; use python-docx Table API (handles merged cells
     correctly) and track the paragraph immediately preceding each table as its
-    title.
+    title.  Also descends into w:sdt content-control wrappers so that
+    paragraphs inside content controls are not missed.
 
     Returns:
       paragraphs : [str, ...]
       table_list : [(title: str, rows: [[str]]), ...]
     """
-    # Map each w:tbl XML element → python-docx Table object
-    tbl_map = {id(t._tbl): t for t in doc.tables}
-
+    tbl_map    = {id(t._tbl): t for t in doc.tables}
     paragraphs = []
     table_list = []
     last_para  = ''
 
-    for elem in doc.element.body:
+    def _rows_from_tbl(tbl):
+        rows = []
+        for row in tbl.rows:
+            seen, cells = set(), []
+            for cell in row.cells:
+                cid = id(cell._tc)
+                if cid not in seen:
+                    seen.add(cid)
+                    cells.append(cell.text.strip())
+            if cells:
+                rows.append(cells)
+        return rows
+
+    def _visit(elem):
+        nonlocal last_para
         tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
 
         if tag == 'p':
@@ -40,21 +53,21 @@ def extract_document(doc):
 
         elif tag == 'tbl':
             tbl = tbl_map.get(id(elem))
-            if tbl is None:
-                continue
-            rows = []
-            for row in tbl.rows:
-                seen, cells = set(), []
-                for cell in row.cells:
-                    cid = id(cell._tc)
-                    if cid not in seen:
-                        seen.add(cid)
-                        cells.append(cell.text.strip())
-                if cells:
-                    rows.append(cells)
-            if rows:
-                table_list.append((last_para, rows))
-            last_para = ''   # consumed
+            if tbl is not None:
+                rows = _rows_from_tbl(tbl)
+                if rows:
+                    table_list.append((last_para, rows))
+                last_para = ''
+
+        elif tag in ('sdt',):
+            # Content-control wrapper — recurse into its content body
+            content = elem.find(qn('w:sdtContent'))
+            target  = content if content is not None else elem
+            for child in target:
+                _visit(child)
+
+    for elem in doc.element.body:
+        _visit(elem)
 
     return paragraphs, table_list
 
@@ -119,23 +132,50 @@ def _norm_heading(text):
     return t.strip()
 
 
+def _count_hs_rows(rows):
+    """Count rows whose first cell looks like an HS tariff code (4+ digits)."""
+    return sum(1 for r in rows if r and re.match(r'^\d{4}', r[0].strip()))
+
+
+def find_hs_table(table_list, skip=None):
+    """Structural detection: return the table with the most HS-code rows."""
+    best_rows, best_n = None, 1   # require at least 2 to avoid false positives
+    for title, rows in table_list:
+        if rows is skip:
+            continue
+        n = _count_hs_rows(rows)
+        if n > best_n:
+            best_n, best_rows = n, rows
+    return best_rows
+
+
 def find_table_by_header(table_list, *keywords):
     """
     Returns rows (list-of-lists) or None.
-    Searches: (a) the preceding-paragraph title (after heading normalisation),
-              (b) the first 3 rows of the table.
-    Accepts tables captioned like '表1　2021-2025年…' as well as tables whose
-    header rows contain the keywords directly.
+    Pass 1 — title + first 3 rows (fast, avoids false positives).
+    Pass 2 — entire table content (catches tables where keyword is in a data row).
     """
+    def _search(parts):
+        return all(kw in ' '.join(parts) for kw in keywords)
+
     for title, rows in table_list:
         if not rows:
             continue
         parts = [_norm_heading(title)] if title else []
         for row in rows[:3]:
-            parts.append(' '.join(cell.replace('\n', '') for cell in row))
-        header = ' '.join(parts)
-        if all(kw in header for kw in keywords):
+            parts.append(' '.join(c.replace('\n', '') for c in row))
+        if _search(parts):
             return rows
+
+    # Second pass: search every row
+    for title, rows in table_list:
+        if not rows:
+            continue
+        full = _norm_heading(title) + ' ' + ' '.join(
+            ' '.join(c for c in row) for row in rows)
+        if all(kw in full for kw in keywords):
+            return rows
+
     return None
 
 
@@ -355,15 +395,12 @@ def parse_full_report(table_list, paragraphs):
     if tbl41 is None:
         tbl41 = find_table_by_header(table_list, '現行稅率', '降稅後稅率')
     if tbl41 is None:
-        tbl41 = find_table_by_header(table_list, '進口金額', '稅率')
+        tbl41 = find_table_by_header(table_list, '進口金額')
     if tbl41 is None:
-        tbl41 = find_table_by_header(table_list, '進口', '現行', '降稅')
+        tbl41 = find_table_by_header(table_list, '進口', '現行稅率')
     if tbl41 is None:
-        # Match by table title paragraph like「表4-1…進口…」or「表1　…進口…」
-        for title, rows in table_list:
-            if re.search(r'表\s*(?:4[-－]?1|[1一])\b', title) and '進口' in title:
-                tbl41 = rows
-                break
+        # Structural: table with most HS-code rows
+        tbl41 = find_hs_table(table_list)
 
     items = []
     if tbl41:
@@ -393,28 +430,14 @@ def parse_full_report(table_list, paragraphs):
     if tbl42 is None:
         tbl42 = find_table_by_header(table_list, '最初收入損失')
     if tbl42 is None:
-        tbl42 = find_table_by_header(table_list, '收入損失', '稅則')
+        tbl42 = find_table_by_header(table_list, '收入損失')
     if tbl42 is None:
-        tbl42 = find_table_by_header(table_list, '降稅後稅率', '關稅')
+        tbl42 = find_table_by_header(table_list, '降稅後稅率')
+        if tbl42 is tbl41:
+            tbl42 = None
     if tbl42 is None:
-        for title, rows in table_list:
-            if rows is tbl41:
-                continue
-            if (re.search(r'表\s*(?:4[-－]?2|[2二])\b', title)
-                    or '最初收入損失' in title or '關稅損失' in title):
-                tbl42 = rows
-                break
-    if tbl42 is None:
-        # Heuristic: table with ≥3 HS-code rows + 合計 row + 億元
-        for title, rows in table_list:
-            if rows is tbl41:
-                continue
-            hs_rows   = [r for r in rows if r and re.match(r'\d{4}[\.\d]*', r[0].strip())]
-            total_row = [r for r in rows if r and '合計' in r[0]]
-            flat      = ' '.join(c for r in rows for c in r)
-            if len(hs_rows) >= 3 and total_row and '億元' in flat:
-                tbl42 = rows
-                break
+        # Structural: second table with most HS-code rows
+        tbl42 = find_hs_table(table_list, skip=tbl41)
 
     item_losses = {}
     if tbl42:
@@ -1191,6 +1214,25 @@ def main():
 
             label = '完整版報告（億元）' if doc_type == 'full' else '簡要格式報告（千元）'
             st.caption(f"識別類型：{label}　｜　表格數量：{len(table_list)}")
+
+            with st.expander("🔍 除錯：段落標題 & 表格內容（辨識有問題時展開查看）"):
+                st.markdown("**段落（含可能的表格前置標題）：**")
+                for i, p in enumerate(paragraphs):
+                    st.text(f"{i+1:>3}: {p[:120]}")
+                st.markdown("---")
+                st.markdown("**偵測到的表格：**")
+                for i, (title, rows) in enumerate(table_list):
+                    hs_n = _count_hs_rows(rows)
+                    st.markdown(
+                        f"**表格 {i+1}**　前置標題：`{title[:80]}`　"
+                        f"列數：{len(rows)}　HS碼列：{hs_n}")
+                    preview = rows[:4]
+                    if preview:
+                        try:
+                            st.dataframe(pd.DataFrame(preview),
+                                         use_container_width=True, hide_index=True)
+                        except Exception:
+                            st.text(str(preview))
 
             if doc_type == 'full':
                 data = parse_full_report(table_list, paragraphs)
