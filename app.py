@@ -956,7 +956,7 @@ def main():
             st.download_button(
                 label=f"📥 下載 Excel：{short[:25]}…" if len(short) > 25 else f"📥 下載 Excel：{short}",
                 data=excel_buf,
-                file_name=f"{short}_驗證結果.xlsx",
+                file_name=f"驗證結果_{short}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"dl_{uploaded_file.name}",
             )
