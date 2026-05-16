@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from docx import Document
+from docx.oxml.ns import qn
 import io
 import re
 from openpyxl import Workbook
@@ -9,7 +10,89 @@ from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="稅式支出評估報告驗證工具", layout="wide")
 
+# ── document extraction with page tracking ────────────────────────────────────
+
+def extract_document(doc):
+    """
+    Walk the document body in order, counting page numbers via explicit
+    page-break elements (w:br w:type="page").
+    Returns:
+      para_list  : [(page_num, text), ...]
+      table_list : [(page_num, [[cell,...], ...]), ...]
+    """
+    current_page = 1
+    para_list = []
+    table_list = []
+
+    for elem in doc.element.body:
+        local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+
+        if local == 'p':
+            for br in elem.iter(qn('w:br')):
+                if br.get(qn('w:type')) == 'page':
+                    current_page += 1
+            text = ''.join(n.text or '' for n in elem.iter(qn('w:t'))).strip()
+            if text:
+                para_list.append((current_page, text))
+
+        elif local == 'tbl':
+            table_page = current_page
+            rows = []
+            for tr in elem.iter(qn('w:tr')):
+                cells = []
+                for tc in tr.iter(qn('w:tc')):
+                    for br in tc.iter(qn('w:br')):
+                        if br.get(qn('w:type')) == 'page':
+                            current_page += 1
+                    cell_text = ''.join(n.text or '' for n in tc.iter(qn('w:t'))).strip()
+                    cells.append(cell_text)
+                if cells:
+                    rows.append(cells)
+            if rows:
+                table_list.append((table_page, rows))
+
+    return para_list, table_list
+
+
+def build_paged_text(para_list, table_list):
+    """
+    Concatenate all content in page order, return (all_text, get_page_func).
+    get_page_func(match_start) → page number for that character position.
+    """
+    by_page = {}
+    for page, text in para_list:
+        by_page.setdefault(page, []).append(text)
+    for page, rows in table_list:
+        for row in rows:
+            by_page.setdefault(page, []).append(' '.join(row))
+
+    pieces = []
+    boundaries = []  # (start_pos, page_num)
+    pos = 0
+    for page_num in sorted(by_page.keys()):
+        boundaries.append((pos, page_num))
+        chunk = '\n'.join(by_page[page_num]) + '\n'
+        pieces.append(chunk)
+        pos += len(chunk)
+
+    all_text = ''.join(pieces)
+
+    def get_page(match_start):
+        page = boundaries[0][1] if boundaries else 1
+        for bpos, bpage in boundaries:
+            if bpos <= match_start:
+                page = bpage
+            else:
+                break
+        return page
+
+    return all_text, get_page
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def page_str(page):
+    return f'第{page}頁' if page else '—'
 
 def clean_num(text):
     if text is None:
@@ -53,29 +136,17 @@ def status_icon(passed):
         return '⚠️'
     return '✅' if passed else '❌'
 
-def extract_tables(doc):
-    tables = []
-    for t in doc.tables:
-        rows = []
-        for row in t.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            rows.append(cells)
-        tables.append(rows)
-    return tables
-
-def extract_paragraphs(doc):
-    return [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-
-def find_table_by_header(tables, *keywords):
-    for rows in tables:
+def find_table_by_header(table_list, *keywords):
+    """Returns (page, rows) or (None, None)."""
+    for page, rows in table_list:
         if not rows:
             continue
         header = ' '.join(cell.replace('\n', '') for cell in rows[0])
         if all(kw in header for kw in keywords):
-            return rows
-    return None
+            return page, rows
+    return None, None
 
-def row_result(section, item, formula, reported, computed, diff, result, note):
+def row_result(section, item, formula, reported, computed, diff, result, note, page=None):
     return {
         '章節': section,
         '驗證項目': item,
@@ -85,6 +156,7 @@ def row_result(section, item, formula, reported, computed, diff, result, note):
         '差異': diff,
         '結果': result,
         '說明': note,
+        '資料頁碼': page_str(page),
     }
 
 # ── formula text extraction ───────────────────────────────────────────────────
@@ -96,10 +168,7 @@ def compact_formula_full(txt):
          if l.startswith('=') and ('×' in l or 'x' in l.lower()) and '億元' in l),
         None
     )
-    result_line = next(
-        (l for l in lines if '新臺幣' in l and '億元' in l),
-        None
-    )
+    result_line = next((l for l in lines if '新臺幣' in l and '億元' in l), None)
     parts = []
     if formula_line:
         parts.append(formula_line)
@@ -112,29 +181,25 @@ def compact_formula_full(txt):
 def compact_formula_braces(txt):
     m = re.search(r'[｛{]\s*[〔\[].*?[〕\]].*?[｝}]', txt, re.DOTALL)
     if m:
-        inner = m.group(0)
-        inner = re.sub(r'\s+', ' ', inner).strip()
-        return inner[:200]
+        return re.sub(r'\s+', ' ', m.group(0)).strip()[:200]
     return ''
 
 # ── document-type detection ───────────────────────────────────────────────────
 
-def detect_type(tables, paragraphs):
-    for rows in tables:
+def detect_type(table_list, para_list):
+    for _page, rows in table_list:
         flat = ' '.join(c for row in rows for c in row)
         if '提案委員' in flat and '法規內容' in flat:
             return 'simplified'
-    all_text = ' '.join(paragraphs)
+    all_text = ' '.join(t for _, t in para_list)
     if '稅式支出評估報告' in all_text and '表4-1' in all_text:
         return 'full'
     if '簡要' in all_text or '提案委員' in all_text:
         return 'simplified'
     return 'full'
 
-# ── NEW: generic table financial scanner ──────────────────────────────────────
+# ── table financial scanner ───────────────────────────────────────────────────
 
-# Priority-ordered keyword map: first match wins.
-# More specific keywords come first to avoid false positives.
 _KEYWORD_MAP = [
     ('total_cit',   ['營利事業所得稅合計', '三項合計']),
     ('vehicle_cit', ['整車業增加稅額', '汽車整車', '整車業', '整車']),
@@ -149,30 +214,25 @@ _KEYWORD_MAP = [
 ]
 
 
-def scan_tables_financial(tables, unit):
+def scan_tables_financial(table_list, unit):
     """
-    Scan every table for financial figures in `unit` (千元 or 億元).
-    Handles two layouts:
-      (A) unit appears inline in each data row  → scan for 'NNN千元' pattern
-      (B) unit only in column header row        → read value from that column
-    Returns dict: {item_key: value} using first-match per key.
+    Scan every table for financial figures in `unit`.
+    Handles (A) unit inline per row, and (B) unit only in column header.
+    Returns dict: {item_key: (value, page)}.
     """
     found = {}
 
-    for rows in tables:
+    for page, rows in table_list:
         if not rows:
             continue
 
-        # Skip tables that contain the unit nowhere — nothing to extract
         table_flat = ' '.join(c for row in rows for c in row)
         if unit not in table_flat:
             continue
 
-        # Detect whether unit lives in the header row (layout B)
         header_text = ' '.join(rows[0])
         unit_in_header = unit in header_text
 
-        # Find which column header contains the unit (prefer exact match)
         val_col = None
         if unit_in_header:
             for ci, cell in enumerate(rows[0]):
@@ -180,23 +240,22 @@ def scan_tables_financial(tables, unit):
                     val_col = ci
                     break
             if val_col is None:
-                val_col = len(rows[0]) - 1  # fallback: last column
+                val_col = len(rows[0]) - 1
 
         for ri, row in enumerate(rows):
             if ri == 0 and unit_in_header:
-                continue  # skip the header row itself
+                continue
 
             row_text = ' '.join(c.strip() for c in row if c.strip())
             if not row_text:
                 continue
 
-            # Skip formula/calculation rows (contains multiplication and unit together)
             if ('×' in row_text or '＋' in row_text) and unit in row_text:
                 continue
 
             val = None
 
-            # --- Layout A: unit appears inline ---
+            # Layout A: unit appears inline
             inline = re.findall(r'([\d,]+(?:\.\d+)?)\s*' + re.escape(unit), row_text)
             if inline:
                 for n in reversed(inline):
@@ -208,21 +267,18 @@ def scan_tables_financial(tables, unit):
                     except ValueError:
                         pass
 
-            # --- Layout B: unit only in header, read from val_col or last columns ---
+            # Layout B: unit only in header — read from val_col or last columns
             if val is None and unit_in_header and val_col is not None:
-                # Prefer the identified column, fall back to rightmost columns
                 candidates = []
                 if val_col < len(row):
                     candidates.append(row[val_col])
-                candidates += list(reversed(row))  # include all as fallback
+                candidates += list(reversed(row))
                 for cell in candidates:
                     cell_t = cell.strip()
                     if not cell_t:
                         continue
-                    # Accept pure numbers (with optional commas/decimals)
                     m = re.fullmatch(r'[\d,]+(?:\.\d+)?', cell_t)
                     if not m:
-                        # Also accept numbers embedded in short strings
                         nums = re.findall(r'(?<!\d)([\d,]{4,}(?:\.\d+)?)(?!\d)', cell_t)
                         if not nums:
                             continue
@@ -238,12 +294,11 @@ def scan_tables_financial(tables, unit):
             if val is None or val < 10:
                 continue
 
-            # Map row label to a known tax item (first match per key wins)
             for key, kws in _KEYWORD_MAP:
                 if key in found:
                     continue
                 if any(kw in row_text for kw in kws):
-                    found[key] = val
+                    found[key] = (val, page)
                     break
 
     return found
@@ -251,13 +306,17 @@ def scan_tables_financial(tables, unit):
 
 # ── full-format parser ────────────────────────────────────────────────────────
 
-def parse_full_report(tables, paragraphs):
+def parse_full_report(table_list, para_list):
     data = {}
+    pages = {}
 
-    # 表4-1: 5-year average import values
-    tbl41 = find_table_by_header(tables, '5年平均') or find_table_by_header(tables, '現行稅率', '降稅後稅率')
+    # 表4-1
+    p41, tbl41 = find_table_by_header(table_list, '5年平均')
+    if tbl41 is None:
+        p41, tbl41 = find_table_by_header(table_list, '現行稅率', '降稅後稅率')
     items = []
     if tbl41:
+        pages['table41'] = p41
         for row in tbl41:
             if len(row) < 3:
                 continue
@@ -278,10 +337,13 @@ def parse_full_report(tables, paragraphs):
                                'import_5yr': imp, 'current_rate': cur_rate, 'after_rate': aft_rate})
     data['items'] = items
 
-    # 表4-2: 最初收入損失法
-    tbl42 = find_table_by_header(tables, '關稅損失') or find_table_by_header(tables, '最初收入損失')
+    # 表4-2
+    p42, tbl42 = find_table_by_header(table_list, '關稅損失')
+    if tbl42 is None:
+        p42, tbl42 = find_table_by_header(table_list, '最初收入損失')
     item_losses = {}
     if tbl42:
+        pages['table42'] = p42
         for row in tbl42:
             if len(row) < 4:
                 continue
@@ -298,25 +360,32 @@ def parse_full_report(tables, paragraphs):
                 item_losses[hs] = loss
     data['item_losses_reported'] = item_losses
 
-    # Identify formula tables (single-cell)
+    # Identify formula tables
     formula_tables = {}
-    for rows in tables:
+    for page, rows in table_list:
         cell_text = '\n'.join(' '.join(row) for row in rows) if rows else ''
         ct = cell_text.replace(' ', '')
         if '汽車整車營利事業所得稅' in cell_text and '×15%' in ct:
             formula_tables['vehicle_cit'] = rows
+            pages['vehicle_cit'] = page
         elif '汽車零組件營利事業所得稅' in cell_text and '×13%' in ct:
             formula_tables['parts_cit'] = rows
+            pages['parts_cit'] = page
         elif '其他工業及服務業營利事業所得稅' in cell_text and '16.' in cell_text:
             formula_tables['other_cit'] = rows
+            pages['other_cit'] = page
         elif '股利所得稅' in cell_text and '盈餘分配比例' in cell_text:
             formula_tables['dividend'] = rows
+            pages['dividend'] = page
         elif '個人所得稅' in cell_text and '平均受雇員工年薪' in cell_text:
             formula_tables['personal'] = rows
+            pages['personal'] = page
         elif '汽車貨物稅' in cell_text and '貨物稅稅率' in cell_text:
             formula_tables['commodity'] = rows
+            pages['commodity'] = page
         elif '加值型營業稅' in cell_text and '加值型營業稅稅率' in cell_text:
             formula_tables['vat'] = rows
+            pages['vat'] = page
 
     data['formula_tables'] = formula_tables
 
@@ -325,7 +394,6 @@ def parse_full_report(tables, paragraphs):
     def get_txt(key):
         return '\n'.join(' '.join(r) for r in formula_tables[key]) if key in formula_tables else ''
 
-    # Vehicle CIT
     txt = get_txt('vehicle_cit')
     m = re.search(r'=\s*([\d\.]+)\s*億元\s*[×x]\s*15%', txt)
     data['vehicle_output'] = float(m.group(1)) if m else 49.0
@@ -333,7 +401,6 @@ def parse_full_report(tables, paragraphs):
     data['vehicle_cit_reported'] = float(m2.group(1)) if m2 else None
     formulas['vehicle_cit'] = compact_formula_full(txt) if txt else ''
 
-    # Parts CIT
     txt = get_txt('parts_cit')
     m = re.search(r'=\s*([\d\.]+)\s*億元\s*[×x]\s*13%', txt)
     data['parts_output'] = float(m.group(1)) if m else 34.31
@@ -341,7 +408,6 @@ def parse_full_report(tables, paragraphs):
     data['parts_cit_reported'] = float(m2.group(1)) if m2 else None
     formulas['parts_cit'] = compact_formula_full(txt) if txt else ''
 
-    # Other CIT
     txt = get_txt('other_cit')
     m = re.search(r'\(\s*([\d\.]+)\s*億元\s*[+＋]\s*([\d\.]+)\s*億元\s*\)', txt)
     if m:
@@ -354,14 +420,12 @@ def parse_full_report(tables, paragraphs):
     data['other_cit_reported'] = float(m2.group(1)) if m2 else None
     formulas['other_cit'] = compact_formula_full(txt) if txt else ''
 
-    # Dividend
     txt = get_txt('dividend')
     all_vals = [float(v) for v in re.findall(r'(?<!\d)([\d]+\.[\d]+)\s*億元', txt)]
     small_vals = [v for v in all_vals if v < 5]
     data['dividend_tax_reported'] = small_vals[-1] if small_vals else 0.77
     formulas['dividend'] = compact_formula_full(txt) if txt else ''
 
-    # Personal
     txt = get_txt('personal')
     m = re.search(r'合計\s*=\s*([\d\.]+)\s*萬元', txt)
     if not m:
@@ -371,86 +435,78 @@ def parse_full_report(tables, paragraphs):
         data['personal_tax_reported'] = float(m.group(1)) / 10000
     formulas['personal'] = compact_formula_full(txt) if txt else ''
 
-    # Commodity
     txt = get_txt('commodity')
     m = re.search(r'新臺幣\s*([\d\.]+)\s*億元', txt)
     data['commodity_tax_reported'] = float(m.group(1)) if m else None
     formulas['commodity'] = compact_formula_full(txt) if txt else ''
 
-    # VAT
     txt = get_txt('vat')
     m = re.search(r'新臺幣\s*([\d\.]+)\s*億元', txt)
     data['vat_reported'] = float(m.group(1)) if m else None
     formulas['vat'] = compact_formula_full(txt) if txt else ''
 
-    # Final net
-    all_text = '\n'.join(paragraphs) + '\n'
-    for rows in tables:
-        for row in rows:
-            all_text += '\n' + ' '.join(row)
+    # Net (search all text)
+    all_text, get_page = build_paged_text(para_list, table_list)
     m = re.search(r'(?:淨增|損益合計|淨[損益額])[^\d+\-]*([\+\-]?\s*[\d\.]+)\s*億元', all_text)
-    data['net_reported'] = float(m.group(1).replace(' ', '')) if m else 0.29
+    if m:
+        data['net_reported'] = float(m.group(1).replace(' ', ''))
+        pages['net'] = get_page(m.start())
+    else:
+        data['net_reported'] = 0.29
 
     data['formulas'] = formulas
-
-    # Scan all tables for financial values (億元) — independent cross-check
-    data['table_values'] = scan_tables_financial(tables, '億元')
+    data['pages'] = pages
+    data['table_values'] = scan_tables_financial(table_list, '億元')
 
     return data
 
 
 # ── simplified-format parser ──────────────────────────────────────────────────
 
-def parse_simplified_report(tables, paragraphs):
+def parse_simplified_report(table_list, para_list):
     data = {}
-    main_table = None
-    for rows in tables:
-        flat = ' '.join(c for row in rows for c in row)
-        if '稅式支出評估' in flat and ('千元' in flat or '2,240' in flat):
-            main_table = rows
-            break
-        if '提案委員' in flat:
-            main_table = rows
-            break
-    if main_table is None and tables:
-        main_table = tables[0]
+    pages = {}
 
-    all_text = '\n'.join(paragraphs)
-    if main_table:
-        for row in main_table:
-            all_text += '\n' + ' '.join(row)
-    for rows in tables:
-        for row in rows:
-            all_text += '\n' + ' '.join(row)
+    all_text, get_page = build_paged_text(para_list, table_list)
 
     def find_k(pattern):
         m = re.search(pattern, all_text, re.DOTALL)
         if m:
             raw = m.group(1).replace(',', '').strip()
             try:
-                return float(raw)
+                return float(raw), get_page(m.start())
             except ValueError:
-                return None
-        return None
+                pass
+        return None, None
 
-    data['total_import_reported_k'] = find_k(r'平均進口值為([\d,]+)千元')
-    data['tariff_loss_reported_k']  = find_k(r'關稅收入減少([\d,]+)千元')
-    data['vehicle_output_k']        = find_k(r'產值(?:變化值|增加額)\s*([\d,]+)千元.*?小客車生產')
-    data['parts_output_k']          = find_k(r'零組件產值增加額為([\d,]+)千元')
-    data['vehicle_cit_reported_k']  = find_k(r'整車業增加稅額約為新臺幣([\d,]+)千元')
-    data['parts_cit_reported_k']    = find_k(r'國產化比例約?70%.*?增加稅額約為新臺幣([\d,]+)千元')
+    def fk(pattern, key):
+        val, pg = find_k(pattern)
+        if val is not None:
+            pages[key] = pg
+        return val
+
+    data['total_import_reported_k'] = fk(r'平均進口值為([\d,]+)千元', 'total_import')
+    data['tariff_loss_reported_k']  = fk(r'關稅收入減少([\d,]+)千元', 'tariff_loss')
+    data['vehicle_output_k']        = fk(r'產值(?:變化值|增加額)\s*([\d,]+)千元.*?小客車生產', 'vehicle_output')
+    data['parts_output_k']          = fk(r'零組件產值增加額為([\d,]+)千元', 'parts_output')
+    data['vehicle_cit_reported_k']  = fk(r'整車業增加稅額約為新臺幣([\d,]+)千元', 'vehicle_cit')
+    data['parts_cit_reported_k']    = fk(r'國產化比例約?70%.*?增加稅額約為新臺幣([\d,]+)千元', 'parts_cit')
     if data['parts_cit_reported_k'] is None:
-        data['parts_cit_reported_k'] = find_k(r'零組件產值增加額為[\d,]+千元.*?增加稅額約為新臺幣([\d,]+)千元')
-    data['other_cit_reported_k']    = find_k(r'就其他工業及服務業部分.*?新臺幣([\d,]+)千元')
-    data['total_cit_reported_k']    = find_k(r'三項合計.*?新臺幣([\d,]+)千元')
-    data['commodity_tax_reported_k']= find_k(r'貨物稅增加額約為新臺幣([\d,]+)千元')
-    data['vat_reported_k']          = find_k(r'加值型營業稅增加額約為新臺幣([\d,]+)千元')
-    data['personal_tax_reported_k'] = find_k(r'員工個人所得稅增加額約為新臺幣([\d,]+)千元')
+        data['parts_cit_reported_k'] = fk(
+            r'零組件產值增加額為[\d,]+千元.*?增加稅額約為新臺幣([\d,]+)千元', 'parts_cit')
+    data['other_cit_reported_k']    = fk(r'就其他工業及服務業部分.*?新臺幣([\d,]+)千元', 'other_cit')
+    data['total_cit_reported_k']    = fk(r'三項合計.*?新臺幣([\d,]+)千元', 'total_cit')
+    data['commodity_tax_reported_k']= fk(r'貨物稅增加額約為新臺幣([\d,]+)千元', 'commodity')
+    data['vat_reported_k']          = fk(r'加值型營業稅增加額約為新臺幣([\d,]+)千元', 'vat')
+    data['personal_tax_reported_k'] = fk(r'員工個人所得稅增加額約為新臺幣([\d,]+)千元', 'personal')
     if data['personal_tax_reported_k'] is None:
-        data['personal_tax_reported_k'] = find_k(r'兩項合計.*?個人所得稅.*?新臺幣([\d,]+)千元')
-    data['dividend_tax_reported_k'] = find_k(r'股東個人股利所得稅增加額約為新臺幣([\d,]+)千元')
-    data['net_reported_k']          = find_k(r'稅收淨收入([\d,]+)千元') or find_k(r'最終稅收.*?([\d,]+)千元')
-    data['other_profit_k']          = find_k(r'增加產值利潤([\d,]+)千元')
+        data['personal_tax_reported_k'] = fk(
+            r'兩項合計.*?個人所得稅.*?新臺幣([\d,]+)千元', 'personal')
+    data['dividend_tax_reported_k'] = fk(r'股東個人股利所得稅增加額約為新臺幣([\d,]+)千元', 'dividend')
+    data['net_reported_k']          = fk(r'稅收淨收入([\d,]+)千元', 'net')
+    if data['net_reported_k'] is None:
+        data['net_reported_k']      = fk(r'最終稅收.*?([\d,]+)千元', 'net')
+    data['other_profit_k']          = fk(r'增加產值利潤([\d,]+)千元', 'other_profit')
 
     # Formula text blocks
     formulas = {}
@@ -483,10 +539,8 @@ def parse_simplified_report(tables, paragraphs):
     formulas['dividend'] = compact_formula_braces(m.group(0)) if m else ''
 
     data['formulas'] = formulas
-    data['all_text'] = all_text
-
-    # Scan all tables for financial values (千元) — independent cross-check
-    data['table_values'] = scan_tables_financial(tables, '千元')
+    data['pages'] = pages
+    data['table_values'] = scan_tables_financial(table_list, '千元')
 
     return data
 
@@ -507,16 +561,16 @@ def verify_full(data):
     results = []
     items  = data.get('items', [])
     forms  = data.get('formulas', {})
+    pages  = data.get('pages', {})
 
     # ── 最初收入損失法 ───────────────────────────────────────────────────────
-
     if items:
         calc_total = round2(sum(it['import_5yr'] for it in items))
         rep = data.get('total_import_reported') or 147.86
         results.append(row_result(
             SEC_TARIFF, '5年平均進口總額 (億元)', '各品項加總',
             fmt(rep), fmt(calc_total), fmt(rep - calc_total),
-            status_icon(ok(rep, calc_total)), ''))
+            status_icon(ok(rep, calc_total)), '', pages.get('table41')))
 
     if items and all(it['current_rate'] is not None for it in items):
         calc_wavg = sum(it['current_rate'] for it in items) / len(items)
@@ -526,7 +580,7 @@ def verify_full(data):
             f'Σ稅率 ÷ {len(items)}',
             f'{rep_wavg*100:.2f}%', f'{calc_wavg*100:.2f}%',
             f'{(rep_wavg-calc_wavg)*100:.4f}%',
-            status_icon(ok(rep_wavg, calc_wavg, tol=0.005)), ''))
+            status_icon(ok(rep_wavg, calc_wavg, tol=0.005)), '', pages.get('table41')))
 
     calc_total_loss = 0
     for it in items:
@@ -544,13 +598,13 @@ def verify_full(data):
             fmt(calc_loss),
             fmt(rep_loss_item - calc_loss) if rep_loss_item else '—',
             status_icon(ok(rep_loss_item, calc_loss)) if rep_loss_item else '⚠️',
-            '關稅損失(億元)'))
+            '關稅損失(億元)', pages.get('table42')))
 
     rep_loss = data.get('tariff_loss_reported') or 22.40
     results.append(row_result(
         SEC_TARIFF, '關稅損失合計 (億元)', 'Σ各品項關稅損失',
         fmt(rep_loss), fmt(calc_total_loss), fmt(rep_loss - calc_total_loss),
-        status_icon(ok(rep_loss, calc_total_loss)), ''))
+        status_icon(ok(rep_loss, calc_total_loss)), '', pages.get('table42')))
 
     # ── 貨物稅 ────────────────────────────────────────────────────────────────
     vo = data.get('vehicle_output', 49.0)
@@ -561,7 +615,7 @@ def verify_full(data):
         forms.get('commodity') or f'{vo}億元×[52.85%×25%×84.19%+47.15%×15%×99.60%]',
         fmt(rep_ct) if rep_ct else '—', fmt(calc_ct),
         fmt(rep_ct - calc_ct) if rep_ct else '—',
-        status_icon(ok(rep_ct, calc_ct)) if rep_ct else '⚠️', ''))
+        status_icon(ok(rep_ct, calc_ct)) if rep_ct else '⚠️', '', pages.get('commodity')))
 
     # ── 加值型營業稅 ──────────────────────────────────────────────────────────
     calc_vat = round2(vo * (0.5285 * 1.25 * 0.05 + 0.4715 * 1.15 * 0.05))
@@ -571,7 +625,7 @@ def verify_full(data):
         forms.get('vat') or f'{vo}億元×[52.85%×125%×5%+47.15%×115%×5%]',
         fmt(rep_vat) if rep_vat else '—', fmt(calc_vat),
         fmt(rep_vat - calc_vat) if rep_vat else '—',
-        status_icon(ok(rep_vat, calc_vat)) if rep_vat else '⚠️', ''))
+        status_icon(ok(rep_vat, calc_vat)) if rep_vat else '⚠️', '', pages.get('vat')))
 
     # ── 營利事業所得稅 ────────────────────────────────────────────────────────
     po = data.get('parts_output', 34.31)
@@ -585,7 +639,7 @@ def verify_full(data):
         forms.get('vehicle_cit') or f'{vo}億元×15%×20%',
         fmt(rep_vcit) if rep_vcit else '—', fmt(calc_vcit),
         fmt(rep_vcit - calc_vcit) if rep_vcit else '—',
-        status_icon(ok(rep_vcit, calc_vcit)) if rep_vcit else '⚠️', ''))
+        status_icon(ok(rep_vcit, calc_vcit)) if rep_vcit else '⚠️', '', pages.get('vehicle_cit')))
 
     calc_pcit = round2(po * 0.13 * 0.20)
     rep_pcit  = data.get('parts_cit_reported')
@@ -594,7 +648,7 @@ def verify_full(data):
         forms.get('parts_cit') or f'{po}億元×13%×20%',
         fmt(rep_pcit) if rep_pcit else '—', fmt(calc_pcit),
         fmt(rep_pcit - calc_pcit) if rep_pcit else '—',
-        status_icon(ok(rep_pcit, calc_pcit)) if rep_pcit else '⚠️', ''))
+        status_icon(ok(rep_pcit, calc_pcit)) if rep_pcit else '⚠️', '', pages.get('parts_cit')))
 
     calc_ocit = round2((op + ts) * 0.20)
     rep_ocit  = data.get('other_cit_reported')
@@ -603,7 +657,7 @@ def verify_full(data):
         forms.get('other_cit') or f'({op}+{ts})億元×20%',
         fmt(rep_ocit) if rep_ocit else '—', fmt(calc_ocit),
         fmt(rep_ocit - calc_ocit) if rep_ocit else '—',
-        status_icon(ok(rep_ocit, calc_ocit)) if rep_ocit else '⚠️', ''))
+        status_icon(ok(rep_ocit, calc_ocit)) if rep_ocit else '⚠️', '', pages.get('other_cit')))
 
     calc_tcit = round2(calc_vcit + calc_pcit + calc_ocit)
     rep_tcit  = data.get('total_cit_reported')
@@ -615,23 +669,21 @@ def verify_full(data):
         SEC_CIT, '營利事業所得稅合計 (億元)', '整車+零組件+其他',
         fmt(rep_tcit) if rep_tcit else '—', fmt(calc_tcit),
         fmt(rep_tcit - calc_tcit) if rep_tcit else '—',
-        status_icon(ok(rep_tcit, calc_tcit)) if rep_tcit else '⚠️', ''))
+        status_icon(ok(rep_tcit, calc_tcit)) if rep_tcit else '⚠️', '', None))
 
-    # ── 個人綜合所得稅 ────────────────────────────────────────────────────────
     rep_per = data.get('personal_tax_reported', 0.0287)
     results.append(row_result(
         SEC_PER, '個人綜合所得稅 (億元)',
         forms.get('personal') or '增聘員工薪資 × 適用稅率',
         fmt(rep_per), '（依文件公式，不重新推算）', '—', '⚠️',
-        '此項依文件所示公式與參數確認'))
+        '此項依文件所示公式與參數確認', pages.get('personal')))
 
-    # ── 股東個人股利所得稅 ────────────────────────────────────────────────────
     rep_div = data.get('dividend_tax_reported', 0.77)
     results.append(row_result(
         SEC_DIV, '股東個人股利所得稅 (億元)',
         forms.get('dividend') or '產值利潤×80%×56%×30%×40.45%×28%',
         fmt(rep_div), '（依文件公式，不重新推算）', '—', '⚠️',
-        '此項依文件所示公式與參數確認'))
+        '此項依文件所示公式與參數確認', pages.get('dividend')))
 
     # ── 淨損益 ────────────────────────────────────────────────────────────────
     calc_net = round2(calc_tcit + rep_div + rep_per + calc_ct + calc_vat - rep_loss)
@@ -641,30 +693,29 @@ def verify_full(data):
         'CIT+股利+個人+貨物稅+營業稅－關稅損失',
         fmt(rep_net), fmt(calc_net), fmt(rep_net - calc_net),
         status_icon(ok(rep_net, calc_net, tol=0.10)),
-        f'{fmt(calc_tcit)}+{fmt(rep_div)}+{fmt(rep_per)}+{fmt(calc_ct)}+{fmt(calc_vat)}−{fmt(rep_loss)}'))
+        f'{fmt(calc_tcit)}+{fmt(rep_div)}+{fmt(rep_per)}+{fmt(calc_ct)}+{fmt(calc_vat)}−{fmt(rep_loss)}',
+        pages.get('net')))
 
     # ── 附：表格數值核對 ──────────────────────────────────────────────────────
     tv = data.get('table_values', {})
     tbl_checks = [
-        ('tariff_loss', '表格：關稅損失 (億元)',   rep_loss,  calc_total_loss),
-        ('commodity',   '表格：貨物稅 (億元)',      rep_ct,    calc_ct),
-        ('vat',         '表格：加值型營業稅 (億元)', rep_vat,   calc_vat),
-        ('vehicle_cit', '表格：整車CIT (億元)',     rep_vcit,  calc_vcit),
-        ('parts_cit',   '表格：零組件CIT (億元)',   rep_pcit,  calc_pcit),
-        ('other_cit',   '表格：其他CIT (億元)',     rep_ocit,  calc_ocit),
-        ('total_cit',   '表格：CIT合計 (億元)',     rep_tcit,  calc_tcit),
-        ('net',         '表格：淨損益 (億元)',       rep_net,   calc_net),
+        ('tariff_loss', '表格：關稅損失 (億元)',            rep_loss,  calc_total_loss),
+        ('commodity',   '表格：貨物稅 (億元)',              rep_ct,    calc_ct),
+        ('vat',         '表格：加值型營業稅 (億元)',         rep_vat,   calc_vat),
+        ('vehicle_cit', '表格：整車CIT (億元)',             rep_vcit,  calc_vcit),
+        ('parts_cit',   '表格：零組件CIT (億元)',           rep_pcit,  calc_pcit),
+        ('other_cit',   '表格：其他CIT (億元)',             rep_ocit,  calc_ocit),
+        ('total_cit',   '表格：CIT合計 (億元)',             rep_tcit,  calc_tcit),
+        ('net',         '表格：淨損益 (億元)',               rep_net,   calc_net),
     ]
     tbl_rows_added = 0
     for key, label, formula_rep, formula_calc in tbl_checks:
         if key not in tv:
             continue
-        tbl_val = tv[key]
-        # Compare table cell value vs formula-computed value
+        tbl_val, tbl_page = tv[key]
         diff_tc = round2(tbl_val - formula_calc) if formula_calc is not None else None
-        note = f'表格讀取={fmt(tbl_val)}，公式計算={fmt(formula_calc)}'
+        note = f'表格值={fmt(tbl_val)}，公式計算={fmt(formula_calc)}'
         if formula_rep is not None:
-            diff_tr = round2(tbl_val - formula_rep)
             note += f'，公式文字={fmt(formula_rep)}'
             passed = ok(tbl_val, formula_calc) and ok(tbl_val, formula_rep)
         else:
@@ -673,7 +724,7 @@ def verify_full(data):
             SEC_TBL, label, '（來自表格欄位）',
             fmt(tbl_val), fmt(formula_calc) if formula_calc else '—',
             fmt(diff_tc) if diff_tc is not None else '—',
-            status_icon(passed), note))
+            status_icon(passed), note, tbl_page))
         tbl_rows_added += 1
 
     if tbl_rows_added == 0:
@@ -689,6 +740,7 @@ def verify_full(data):
 def verify_simplified(data):
     results = []
     forms = data.get('formulas', {})
+    pages = data.get('pages', {})
 
     VEHICLE_NET_MARGIN = 0.15
     PARTS_NET_MARGIN   = 0.13
@@ -715,17 +767,16 @@ def verify_simplified(data):
     rep_ct   = data.get('commodity_tax_reported_k') or 890371
     rep_vat  = data.get('vat_reported_k')           or 294747
     rep_net  = data.get('net_reported_k')           or 29231
-
     OTHER_PROFIT_K = data.get('other_profit_k') or 1604091
 
     # ── 最初收入損失法 ────────────────────────────────────────────────────────
     rep_import = data.get('total_import_reported_k') or 14785668
     results.append(row_result(
         SEC_TARIFF, '5年平均進口總額 (千元)', '依財政部關務署統計',
-        fmt(rep_import, 0), '（引用文件值）', '—', '⚠️', ''))
+        fmt(rep_import, 0), '（引用文件值）', '—', '⚠️', '', pages.get('total_import')))
     results.append(row_result(
         SEC_TARIFF, '關稅損失 (千元)', '進口額×降稅幅度',
-        fmt(rep_loss, 0), '（引用文件值）', '—', '⚠️', '最初收入損失法'))
+        fmt(rep_loss, 0), '（引用文件值）', '—', '⚠️', '最初收入損失法', pages.get('tariff_loss')))
 
     # ── 貨物稅 ────────────────────────────────────────────────────────────────
     calc_ct = round2(rep_vo * (DOMESTIC_SHARE * DOMESTIC_CT_RATE * DOMESTIC_TAXABLE
@@ -734,7 +785,7 @@ def verify_simplified(data):
         SEC_CT, '貨物稅 (千元)',
         forms.get('commodity') or f'{fmt(rep_vo,0)}×[52.85%×25%×84.19%+47.15%×15%×99.60%]',
         fmt(rep_ct, 0), fmt(calc_ct, 0), fmt(rep_ct - calc_ct, 0),
-        status_icon(ok(rep_ct, calc_ct)), ''))
+        status_icon(ok(rep_ct, calc_ct)), '', pages.get('commodity')))
 
     # ── 加值型營業稅 ──────────────────────────────────────────────────────────
     calc_vat = round2(rep_vo * (DOMESTIC_SHARE * DOMESTIC_TAX_BASE * VAT_RATE
@@ -743,7 +794,7 @@ def verify_simplified(data):
         SEC_VAT, '加值型營業稅 (千元)',
         forms.get('vat') or f'{fmt(rep_vo,0)}×[52.85%×125%×5%+47.15%×115%×5%]',
         fmt(rep_vat, 0), fmt(calc_vat, 0), fmt(rep_vat - calc_vat, 0),
-        status_icon(ok(rep_vat, calc_vat)), ''))
+        status_icon(ok(rep_vat, calc_vat)), '', pages.get('vat')))
 
     # ── 營利事業所得稅 ────────────────────────────────────────────────────────
     calc_vcit = round2(rep_vo * VEHICLE_NET_MARGIN * CIT_RATE)
@@ -752,7 +803,7 @@ def verify_simplified(data):
         forms.get('vehicle_cit') or f'{fmt(rep_vo,0)}×15%×20%',
         fmt(rep_vcit, 0) if rep_vcit else '—', fmt(calc_vcit, 0),
         fmt(rep_vcit - calc_vcit, 0) if rep_vcit else '—',
-        status_icon(ok(rep_vcit, calc_vcit)) if rep_vcit else '⚠️', ''))
+        status_icon(ok(rep_vcit, calc_vcit)) if rep_vcit else '⚠️', '', pages.get('vehicle_cit')))
 
     calc_pcit = round2(rep_po * PARTS_NET_MARGIN * CIT_RATE)
     results.append(row_result(
@@ -760,7 +811,7 @@ def verify_simplified(data):
         forms.get('parts_cit') or f'{fmt(rep_po,0)}×13%×20%',
         fmt(rep_pcit, 0) if rep_pcit else '—', fmt(calc_pcit, 0),
         fmt(rep_pcit - calc_pcit, 0) if rep_pcit else '—',
-        status_icon(ok(rep_pcit, calc_pcit)) if rep_pcit else '⚠️', ''))
+        status_icon(ok(rep_pcit, calc_pcit)) if rep_pcit else '⚠️', '', pages.get('parts_cit')))
 
     calc_ocit = round2((OTHER_PROFIT_K + rep_loss) * CIT_RATE)
     results.append(row_result(
@@ -768,26 +819,24 @@ def verify_simplified(data):
         forms.get('other_cit') or f'({fmt(OTHER_PROFIT_K,0)}+{fmt(rep_loss,0)})×20%',
         fmt(rep_ocit, 0) if rep_ocit else '—', fmt(calc_ocit, 0),
         fmt(rep_ocit - calc_ocit, 0) if rep_ocit else '—',
-        status_icon(ok(rep_ocit, calc_ocit)) if rep_ocit else '⚠️', ''))
+        status_icon(ok(rep_ocit, calc_ocit)) if rep_ocit else '⚠️', '', pages.get('other_cit')))
 
     calc_tcit = round2(calc_vcit + calc_pcit + calc_ocit)
     results.append(row_result(
         SEC_CIT, '營利事業所得稅合計 (千元)', '整車+零組件+其他',
         fmt(rep_tcit, 0) if rep_tcit else '—', fmt(calc_tcit, 0),
         fmt(rep_tcit - calc_tcit, 0) if rep_tcit else '—',
-        status_icon(ok(rep_tcit, calc_tcit)) if rep_tcit else '⚠️', ''))
+        status_icon(ok(rep_tcit, calc_tcit)) if rep_tcit else '⚠️', '', pages.get('total_cit')))
 
-    # ── 個人綜合所得稅 ────────────────────────────────────────────────────────
     results.append(row_result(
         SEC_PER, '個人綜合所得稅 (千元)',
         forms.get('personal') or '增聘員工薪資×適用稅率',
-        fmt(rep_per, 0), '（依文件值）', '—', '⚠️', '依文件公式確認'))
+        fmt(rep_per, 0), '（依文件值）', '—', '⚠️', '依文件公式確認', pages.get('personal')))
 
-    # ── 股東個人股利所得稅 ────────────────────────────────────────────────────
     results.append(row_result(
         SEC_DIV, '股東個人股利所得稅 (千元)',
         forms.get('dividend') or '產值利潤×80%×56%×30%×40.45%×28%',
-        fmt(rep_div, 0), '（依文件值）', '—', '⚠️', '依文件公式確認'))
+        fmt(rep_div, 0), '（依文件值）', '—', '⚠️', '依文件公式確認', pages.get('dividend')))
 
     # ── 淨損益 ────────────────────────────────────────────────────────────────
     calc_net = round2(calc_vcit + calc_pcit + calc_ocit + rep_per + rep_div
@@ -797,12 +846,13 @@ def verify_simplified(data):
         'CIT+股利+個人+貨物稅+營業稅－關稅損失',
         fmt(rep_net, 0), fmt(calc_net, 0), fmt(rep_net - calc_net, 0),
         status_icon(ok(rep_net, calc_net, tol=0.05)),
-        f'{fmt(calc_tcit,0)}+{fmt(rep_div,0)}+{fmt(rep_per,0)}+{fmt(calc_ct,0)}+{fmt(calc_vat,0)}−{fmt(rep_loss,0)}'))
+        f'{fmt(calc_tcit,0)}+{fmt(rep_div,0)}+{fmt(rep_per,0)}+{fmt(calc_ct,0)}+{fmt(calc_vat,0)}−{fmt(rep_loss,0)}',
+        pages.get('net')))
 
     # ── 附：表格數值核對 ──────────────────────────────────────────────────────
     tv = data.get('table_values', {})
     tbl_checks = [
-        ('tariff_loss', '表格：關稅損失 (千元)',          rep_loss,  None),
+        ('tariff_loss', '表格：關稅損失 (千元)',           rep_loss,  None),
         ('commodity',   '表格：貨物稅 (千元)',             rep_ct,    calc_ct),
         ('vat',         '表格：加值型營業稅 (千元)',        rep_vat,   calc_vat),
         ('vehicle_cit', '表格：整車CIT (千元)',            rep_vcit,  calc_vcit),
@@ -815,7 +865,7 @@ def verify_simplified(data):
     for key, label, text_rep, formula_calc in tbl_checks:
         if key not in tv:
             continue
-        tbl_val = tv[key]
+        tbl_val, tbl_page = tv[key]
         calc_ref = formula_calc if formula_calc is not None else text_rep
         diff_tc = round2(tbl_val - calc_ref) if calc_ref is not None else None
         note = f'表格讀取={fmt(tbl_val, 0)}'
@@ -829,7 +879,7 @@ def verify_simplified(data):
             fmt(tbl_val, 0),
             fmt(formula_calc, 0) if formula_calc is not None else '（引用）',
             fmt(diff_tc, 0) if diff_tc is not None else '—',
-            status_icon(passed), note))
+            status_icon(passed), note, tbl_page))
         tbl_rows_added += 1
 
     if tbl_rows_added == 0:
@@ -840,7 +890,7 @@ def verify_simplified(data):
     return pd.DataFrame(results)
 
 
-# ── Excel export (single file) ────────────────────────────────────────────────
+# ── Excel export ──────────────────────────────────────────────────────────────
 
 FILL_GREEN   = PatternFill('solid', fgColor='C6EFCE')
 FILL_RED     = PatternFill('solid', fgColor='FFC7CE')
@@ -926,7 +976,7 @@ def main():
 - **簡要格式報告**（如「稅式支出評估報告(簡要格式)」.F2.docx）
   - 驗證：千元單位下各稅目公式計算、表格數值核對
 
-每份檔案分別產生一份 Excel 驗證報告供下載。
+每份檔案分別產生一份 Excel 驗證報告供下載，結果含**資料頁碼**欄位。
         """)
         return
 
@@ -934,19 +984,18 @@ def main():
         st.divider()
         st.subheader(f"📄 {uploaded_file.name}")
         try:
-            doc        = Document(io.BytesIO(uploaded_file.read()))
-            tables     = extract_tables(doc)
-            paragraphs = extract_paragraphs(doc)
-            doc_type   = detect_type(tables, paragraphs)
+            doc = Document(io.BytesIO(uploaded_file.read()))
+            para_list, table_list = extract_document(doc)
+            doc_type = detect_type(table_list, para_list)
 
             label = '完整版報告（億元）' if doc_type == 'full' else '簡要格式報告（千元）'
-            st.caption(f"識別類型：{label}　｜　表格數量：{len(tables)}")
+            st.caption(f"識別類型：{label}　｜　表格數量：{len(table_list)}")
 
             if doc_type == 'full':
-                data = parse_full_report(tables, paragraphs)
+                data = parse_full_report(table_list, para_list)
                 df   = verify_full(data)
             else:
-                data = parse_simplified_report(tables, paragraphs)
+                data = parse_simplified_report(table_list, para_list)
                 df   = verify_simplified(data)
 
             # Summary metrics
@@ -968,14 +1017,12 @@ def main():
                          else '#FFEB9C')
                 return [f'background-color: {color}'] * len(row)
 
-            # Group by section
             for sec, group in df.groupby('章節', sort=False):
                 st.markdown(f"**{sec}**")
                 g = group[display_cols].reset_index(drop=True)
                 st.dataframe(g.style.apply(highlight, axis=1),
                              use_container_width=True, hide_index=True)
 
-            # Per-item tariff table (full report only)
             if doc_type == 'full' and data.get('items'):
                 with st.expander("展開：各品項明細表（表4-1）"):
                     item_df = pd.DataFrame(data['items'])
@@ -988,25 +1035,26 @@ def main():
                                            '現行稅率', '降稅後稅率', '計算關稅損失(億元)']
                         st.dataframe(item_df, use_container_width=True, hide_index=True)
 
-            # Debug: show which table values were detected
             tv = data.get('table_values', {})
             if tv:
                 with st.expander(f"展開：偵測到的表格數值（共 {len(tv)} 項）"):
                     unit = '億元' if doc_type == 'full' else '千元'
                     tv_df = pd.DataFrame([
-                        {'稅目鍵值': k, f'表格讀取值（{unit}）': fmt(v, 0 if unit == '千元' else 2)}
-                        for k, v in tv.items()
+                        {'稅目鍵值': k,
+                         f'表格讀取值（{unit}）': fmt(v, 0 if unit == '千元' else 2),
+                         '來源頁碼': page_str(p)}
+                        for k, (v, p) in tv.items()
                     ])
                     st.dataframe(tv_df, use_container_width=True, hide_index=True)
 
-            # Per-file Excel download
             short = (uploaded_file.name
                      .replace('.docx', '')
                      .replace('「', '').replace('」', '')
                      [:30])
             excel_buf = to_excel_single(df, short)
+            btn_label = f"📥 下載 Excel：{short[:25]}…" if len(short) > 25 else f"📥 下載 Excel：{short}"
             st.download_button(
-                label=f"📥 下載 Excel：{short[:25]}…" if len(short) > 25 else f"📥 下載 Excel：{short}",
+                label=btn_label,
                 data=excel_buf,
                 file_name=f"驗證結果_{short}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
