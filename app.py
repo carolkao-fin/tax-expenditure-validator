@@ -7,7 +7,6 @@ import re
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-import pdfplumber
 
 st.set_page_config(page_title="稅式支出評估報告驗證工具", layout="wide")
 
@@ -30,6 +29,7 @@ def extract_document(doc):
     current_page = 1
     para_list = []
     table_list = []
+    last_para_title = ''   # text of the paragraph immediately before each table
 
     for elem in doc.element.body:
         local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
@@ -60,6 +60,7 @@ def extract_document(doc):
             text = ''.join(n.text or '' for n in elem.iter(qn('w:t'))).strip()
             if text:
                 para_list.append((current_page, text))
+                last_para_title = text
             current_page += breaks_after_text
 
         elif local == 'tbl':
@@ -94,66 +95,23 @@ def extract_document(doc):
                     row_pages.append(current_page)
 
             if rows:
-                table_list.append((table_start_page, rows, row_pages))
+                table_list.append((table_start_page, rows, row_pages, last_para_title))
+                last_para_title = ''   # consumed; reset so next table starts clean
 
     return para_list, table_list
 
 
 def _tbl(entry):
     """Unpack a table_list entry into (start_page, rows, row_pages)."""
-    if len(entry) == 3:
-        return entry
+    if len(entry) >= 3:
+        return entry[0], entry[1], entry[2]
     page, rows = entry
     return page, rows, [page] * len(rows)
 
 
-def extract_pdf(file_bytes):
-    """
-    Extract paragraphs and tables from a PDF file with accurate page numbers.
-    Each page in the PDF is a hard page boundary — no heuristics required.
-    Table regions are excluded from text extraction to avoid duplication.
-    Returns (para_list, table_list) in the same format as extract_document().
-    """
-    para_list  = []
-    table_list = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            # Detect table objects and extract structured rows
-            found_tables = page.find_tables()
-            table_bboxes = []
-            for tbl_obj in found_tables:
-                table_bboxes.append(tbl_obj.bbox)
-                rows = []
-                for row in tbl_obj.extract():
-                    cells = [str(c or '').strip() for c in row]
-                    if any(c for c in cells):
-                        rows.append(cells)
-                if rows:
-                    table_list.append((page_num, rows, [page_num] * len(rows)))
-
-            # Extract text only from areas outside table bounding boxes
-            # so table content doesn't appear twice in all_text.
-            if table_bboxes:
-                def not_in_any_table(obj, _bboxes=table_bboxes):
-                    ox0 = obj.get('x0', 0)
-                    ox1 = obj.get('x1', 0)
-                    ot  = obj.get('top', 0)
-                    ob  = obj.get('bottom', 0)
-                    for x0, top, x1, bottom in _bboxes:
-                        if ox0 >= x0 - 2 and ox1 <= x1 + 2 and ot >= top - 2 and ob <= bottom + 2:
-                            return False
-                    return True
-                text_page = page.filter(not_in_any_table)
-            else:
-                text_page = page
-
-            text = text_page.extract_text(x_tolerance=3, y_tolerance=3) or ''
-            for line in text.split('\n'):
-                line = line.strip()
-                if line:
-                    para_list.append((page_num, line))
-
-    return para_list, table_list
+def _tbl_title(entry):
+    """Return the preceding-paragraph title stored in a 4-tuple entry ('' if absent)."""
+    return entry[3] if len(entry) >= 4 else ''
 
 
 def build_paged_text(para_list, table_list):
@@ -242,17 +200,29 @@ def status_icon(passed):
 def find_table_by_header(table_list, *keywords):
     """
     Returns (page, rows) or (None, None).
-    Searches the first 3 rows so tables with a merged group-header row above
-    the actual column headers are still matched.
+    Searches the preceding-paragraph title AND the first 3 rows of each table,
+    so tables identified by a caption like「表4-1　2021-2025年…」are also matched.
+    Keywords are matched after normalising full-width parentheses and stripping
+    leading list-markers such as (一), 1., (1), 一、 so that alternative heading
+    formats (e.g. 「(一)最初收入損失法」vs「一、最初收入損失法」) both work.
     """
+    def _norm(text):
+        t = text.replace('（', '(').replace('）', ')')
+        t = re.sub(r'^\s*(?:[(\[（][一二三四五六七八九十百\d]+[)\]）]'
+                   r'|[\d]+[\.、．]'
+                   r'|[一二三四五六七八九十]+[、．])\s*', '', t)
+        return t
+
     for entry in table_list:
         page, rows, _ = _tbl(entry)
+        title = _tbl_title(entry)
         if not rows:
             continue
-        header = ' '.join(
-            ' '.join(cell.replace('\n', '') for cell in row)
-            for row in rows[:3]
-        )
+        # Combine preceding title + first 3 rows; normalise each piece
+        parts = [_norm(title)] if title else []
+        for row in rows[:3]:
+            parts.append(' '.join(cell.replace('\n', '') for cell in row))
+        header = ' '.join(parts)
         if all(kw in header for kw in keywords):
             return page, rows
     return None, None
@@ -300,12 +270,31 @@ def compact_formula_braces(txt):
 def detect_type(table_list, para_list):
     for entry in table_list:
         _, rows, _ = _tbl(entry)
-        flat = ' '.join(c for row in rows for c in row)
+        title = _tbl_title(entry)
+        flat = title + ' ' + ' '.join(c for row in rows for c in row)
         if '提案委員' in flat and '法規內容' in flat:
             return 'simplified'
+
     all_text = ' '.join(t for _, t in para_list)
+
+    # Primary signals
     if '稅式支出評估報告' in all_text and '表4-1' in all_text:
         return 'full'
+
+    # Alternative heading formats: (一)最初收入損失法 / 一、最初收入損失法 etc.
+    if re.search(r'[（(][一][）)][\s　]*最初收入損失|一[、．][\s　]*最初收入損失', all_text):
+        return 'full'
+    # Sub-heading patterns like「1.關稅」or「(1) 就汽車整車部分」signal full-format content
+    if (re.search(r'(?:^|[\n　\s])[（(]?1[）)]?[\s　]*[\.。]?[\s　]*(?:關稅|進口)', all_text)
+            and '最初收入損失法' in all_text):
+        return 'full'
+
+    # Table title signals (e.g. preceding paragraph 「表4-1…」or「表1　進口…」)
+    for entry in table_list:
+        title = _tbl_title(entry)
+        if re.search(r'表\s*4[-－]?[12]', title) or '進口金額' in title or '關稅損失' in title:
+            return 'full'
+
     if '簡要' in all_text or '提案委員' in all_text:
         return 'simplified'
     return 'full'
@@ -465,10 +454,20 @@ def parse_full_report(table_list, para_list):
     data = {}
     pages = {}
 
-    # 表4-1
+    # 表4-1 — try header keywords, then table-title keywords
     p41, tbl41 = find_table_by_header(table_list, '5年平均')
     if tbl41 is None:
         p41, tbl41 = find_table_by_header(table_list, '現行稅率', '降稅後稅率')
+    if tbl41 is None:
+        p41, tbl41 = find_table_by_header(table_list, '進口金額', '稅率')
+    if tbl41 is None:
+        # Match by table title paragraph like「表4-1…」or「表1　…進口…」
+        for entry in table_list:
+            page, rows, _ = _tbl(entry)
+            title = _tbl_title(entry)
+            if re.search(r'表\s*(?:4[-－]?1|[1一])\b', title) and '進口' in title:
+                p41, tbl41 = page, rows
+                break
     items = []
     if tbl41:
         pages['table41'] = p41
@@ -492,7 +491,7 @@ def parse_full_report(table_list, para_list):
                                'import_5yr': imp, 'current_rate': cur_rate, 'after_rate': aft_rate})
     data['items'] = items
 
-    # 表4-2 — try multiple header patterns
+    # 表4-2 — try multiple header patterns then table-title patterns
     p42, tbl42 = find_table_by_header(table_list, '關稅損失')
     if tbl42 is None:
         p42, tbl42 = find_table_by_header(table_list, '最初收入損失')
@@ -500,6 +499,15 @@ def parse_full_report(table_list, para_list):
         p42, tbl42 = find_table_by_header(table_list, '收入損失', '稅則')
     if tbl42 is None:
         p42, tbl42 = find_table_by_header(table_list, '降稅後稅率', '關稅')
+    if tbl42 is None:
+        for entry in table_list:
+            page, rows, _ = _tbl(entry)
+            title = _tbl_title(entry)
+            if (re.search(r'表\s*(?:4[-－]?2|[2二])\b', title)
+                    or ('最初收入損失' in title or '關稅損失' in title)):
+                if rows is not tbl41:
+                    p42, tbl42 = page, rows
+                    break
     # Last resort: a table with multiple HS-code rows and a 合計 row
     if tbl42 is None:
         for entry in table_list:
@@ -1325,21 +1333,20 @@ def main():
     st.markdown("上傳 Word 報告（完整版 F2 或簡要格式），自動驗證所有計算，並匯出各份 Excel 驗證報告。")
 
     uploaded_files = st.file_uploader(
-        "選擇檔案（Word 或 PDF，可一次上傳多份）",
-        type=['docx', 'pdf'],
+        "選擇 Word 檔案（.docx，可一次上傳多份）",
+        type=['docx'],
         accept_multiple_files=True,
-        help="支援 .docx（Word）與 .pdf，PDF 頁碼精確；支援完整版（億元）與簡要格式（千元）",
+        help="支援完整版報告（億元）與簡要格式報告（千元）",
     )
 
     if not uploaded_files:
         st.markdown("""
 **支援格式：**
-- **完整版報告**（如「汽車零組件關稅調降稅式支出評估報告」.F2.docx / .pdf）
+- **完整版報告**（如「汽車零組件關稅調降稅式支出評估報告」.F2.docx）
   - 驗證：進口基準值、各品項關稅損失（表4-1/4-2）、各稅目公式計算、表格數值核對、最終淨損益
-- **簡要格式報告**（如「稅式支出評估報告(簡要格式)」.F2.docx / .pdf）
+- **簡要格式報告**（如「稅式支出評估報告(簡要格式)」.F2.docx）
   - 驗證：千元單位下各稅目公式計算、表格數值核對
 
-上傳 **PDF** 可獲得精確頁碼（PDF 每頁為明確邊界，無需推算）。
 每份檔案分別產生一份 Excel 驗證報告供下載，結果含**資料頁碼**欄位。
         """)
         return
@@ -1349,13 +1356,8 @@ def main():
         st.subheader(f"📄 {uploaded_file.name}")
         try:
             raw_bytes = uploaded_file.read()
-            if uploaded_file.name.lower().endswith('.pdf'):
-                para_list, table_list = extract_pdf(raw_bytes)
-                file_fmt = 'PDF'
-            else:
-                doc = Document(io.BytesIO(raw_bytes))
-                para_list, table_list = extract_document(doc)
-                file_fmt = 'Word'
+            doc = Document(io.BytesIO(raw_bytes))
+            para_list, table_list = extract_document(doc)
             doc_type = detect_type(table_list, para_list)
 
             label = '完整版報告（億元）' if doc_type == 'full' else '簡要格式報告（千元）'
@@ -1364,7 +1366,7 @@ def main():
                 _, _, rp = _tbl(entry)
                 if rp:
                     max_page = max(max_page, max(rp))
-            st.caption(f"識別類型：{label}　｜　格式：{file_fmt}　｜　表格數量：{len(table_list)}　｜　偵測頁數：第1～{max_page}頁")
+            st.caption(f"識別類型：{label}　｜　表格數量：{len(table_list)}　｜　偵測頁數：第1～{max_page}頁")
 
             if doc_type == 'full':
                 data = parse_full_report(table_list, para_list)
