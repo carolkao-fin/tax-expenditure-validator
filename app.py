@@ -504,6 +504,8 @@ def parse_full_report(table_list, para_list):
     if tbl42 is None:
         for entry in table_list:
             page, rows, _ = _tbl(entry)
+            if rows is tbl41:   # don't re-match 表4-1
+                continue
             hs_rows = [r for r in rows if r and re.match(r'\d{4}[\.\d]*', r[0].strip())]
             total_row = [r for r in rows if r and '合計' in r[0]]
             flat = ' '.join(c for r in rows for c in r)
@@ -529,34 +531,53 @@ def parse_full_report(table_list, para_list):
                 item_losses[hs] = loss
     data['item_losses_reported'] = item_losses
 
-    # Identify formula tables
+    # Identify formula tables — use regex for flexible keyword matching
     formula_tables = {}
     for entry in table_list:
         page, rows, _ = _tbl(entry)
         cell_text = '\n'.join(' '.join(row) for row in rows) if rows else ''
-        ct = cell_text.replace(' ', '')
-        if '汽車整車營利事業所得稅' in cell_text and '×15%' in ct:
+        ct = cell_text.replace(' ', '').replace('　', '')  # strip full-width space too
+
+        def has(kw): return kw in cell_text
+        def has_re(pattern): return bool(re.search(pattern, ct))
+
+        if 'vehicle_cit' not in formula_tables and (
+                has('汽車整車營利事業所得稅') or has('整車業') and has('淨利率')) and (
+                has_re(r'[×x]\s*15') or has_re(r'15%.*?20%')):
             formula_tables['vehicle_cit'] = rows
             pages['vehicle_cit'] = page
-        elif '汽車零組件營利事業所得稅' in cell_text and '×13%' in ct:
+
+        elif 'parts_cit' not in formula_tables and (
+                has('汽車零組件營利事業所得稅') or has('零組件業') and has('淨利率')) and (
+                has_re(r'[×x]\s*13') or has_re(r'13%.*?20%')):
             formula_tables['parts_cit'] = rows
             pages['parts_cit'] = page
-        elif '其他工業及服務業營利事業所得稅' in cell_text and '16.' in cell_text:
+
+        elif 'other_cit' not in formula_tables and (
+                has('其他工業及服務業營利事業所得稅') or has('其他工業及服務業') and has('所得稅')) and (
+                has_re(r'16[\.,]') or has_re(r'22[\.,]') or has('其他利潤')):
             formula_tables['other_cit'] = rows
             pages['other_cit'] = page
-        elif ('股利所得稅' in cell_text or '股東個人股利' in cell_text) and (
-                '盈餘分配比例' in cell_text or '盈餘分配率' in cell_text or '分配比例' in cell_text):
+
+        elif 'dividend' not in formula_tables and (
+                has('股利所得稅') or has('股東個人股利') or has('股東股利')) and (
+                has('盈餘分配比例') or has('盈餘分配率') or has('分配比例') or has('分配率')):
             formula_tables['dividend'] = rows
             pages['dividend'] = page
-        elif ('個人所得稅' in cell_text or '個人綜合所得稅' in cell_text or '薪資所得稅' in cell_text) and (
-                '平均受雇員工年薪' in cell_text or '平均薪資' in cell_text or '員工薪資' in cell_text
-                or '增聘' in cell_text):
+
+        elif 'personal' not in formula_tables and (
+                has('個人所得稅') or has('個人綜合所得稅') or has('薪資所得稅') or has('員工所得稅')) and (
+                has('平均受雇員工年薪') or has('平均薪資') or has('員工薪資') or has('增聘')):
             formula_tables['personal'] = rows
             pages['personal'] = page
-        elif '汽車貨物稅' in cell_text and '貨物稅稅率' in cell_text:
+
+        elif 'commodity' not in formula_tables and (
+                has('貨物稅') and (has('貨物稅稅率') or has('汽車貨物稅') or has_re(r'25%') or has_re(r'15%'))):
             formula_tables['commodity'] = rows
             pages['commodity'] = page
-        elif '加值型營業稅' in cell_text and '加值型營業稅稅率' in cell_text:
+
+        elif 'vat' not in formula_tables and (
+                has('加值型營業稅') and (has('加值型營業稅稅率') or has('營業稅率') or has_re(r'5%'))):
             formula_tables['vat'] = rows
             pages['vat'] = page
 
@@ -1400,6 +1421,20 @@ def main():
                         for k, (v, p) in tv.items()
                     ])
                     st.dataframe(tv_df, use_container_width=True, hide_index=True)
+
+            with st.expander(f"🔍 診斷：文件所有表格（共 {len(table_list)} 個）"):
+                for ti, entry in enumerate(table_list):
+                    pg, rows, rp = _tbl(entry)
+                    pages_range = f"第{min(rp)}～{max(rp)}頁" if rp else f"第{pg}頁"
+                    st.markdown(f"**表格 #{ti+1}**　{pages_range}　共 {len(rows)} 列")
+                    preview = rows[:4]
+                    if preview:
+                        st.dataframe(
+                            pd.DataFrame(preview),
+                            use_container_width=True, hide_index=True)
+                if doc_type == 'full':
+                    ft = data.get('formula_tables', {})
+                    st.markdown(f"**識別到的公式表格：** {list(ft.keys()) or '（無）'}")
 
             short = (uploaded_file.name
                      .replace('.docx', '')
