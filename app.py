@@ -151,42 +151,94 @@ _KEYWORD_MAP = [
 
 def scan_tables_financial(tables, unit):
     """
-    Scan every table cell-row for financial figures expressed in `unit` (千元 or 億元).
-    Skips rows that look like formula rows (contain × ＋ or mid-row =).
+    Scan every table for financial figures in `unit` (千元 or 億元).
+    Handles two layouts:
+      (A) unit appears inline in each data row  → scan for 'NNN千元' pattern
+      (B) unit only in column header row        → read value from that column
     Returns dict: {item_key: value} using first-match per key.
     """
     found = {}
 
     for rows in tables:
-        for row in rows:
+        if not rows:
+            continue
+
+        # Skip tables that contain the unit nowhere — nothing to extract
+        table_flat = ' '.join(c for row in rows for c in row)
+        if unit not in table_flat:
+            continue
+
+        # Detect whether unit lives in the header row (layout B)
+        header_text = ' '.join(rows[0])
+        unit_in_header = unit in header_text
+
+        # Find which column header contains the unit (prefer exact match)
+        val_col = None
+        if unit_in_header:
+            for ci, cell in enumerate(rows[0]):
+                if unit in cell:
+                    val_col = ci
+                    break
+            if val_col is None:
+                val_col = len(rows[0]) - 1  # fallback: last column
+
+        for ri, row in enumerate(rows):
+            if ri == 0 and unit_in_header:
+                continue  # skip the header row itself
+
             row_text = ' '.join(c.strip() for c in row if c.strip())
             if not row_text:
                 continue
 
-            # Skip header rows and formula-text rows
-            if any(sym in row_text for sym in ('×', '＋', '÷')) and '=' in row_text:
-                continue
-            if '稅率' in row_text and '%' in row_text and unit not in row_text:
+            # Skip formula/calculation rows (contains multiplication and unit together)
+            if ('×' in row_text or '＋' in row_text) and unit in row_text:
                 continue
 
-            # Extract numeric value associated with the unit
-            nums_with_unit = re.findall(r'([\d,]+(?:\.\d+)?)\s*' + re.escape(unit), row_text)
-            if not nums_with_unit:
-                # For tables where the unit is in the header, try last column
-                last_cell = row[-1].strip() if row else ''
-                nums_plain = re.findall(r'(?<![%\d])([\d,]{4,})(?!\d)', last_cell)
-                if not nums_plain:
-                    continue
-                nums_with_unit = [nums_plain[-1]]
+            val = None
 
-            try:
-                val = float(nums_with_unit[-1].replace(',', ''))
-            except (ValueError, IndexError):
-                continue
-            if val < 10:
+            # --- Layout A: unit appears inline ---
+            inline = re.findall(r'([\d,]+(?:\.\d+)?)\s*' + re.escape(unit), row_text)
+            if inline:
+                for n in reversed(inline):
+                    try:
+                        v = float(n.replace(',', ''))
+                        if v >= 10:
+                            val = v
+                            break
+                    except ValueError:
+                        pass
+
+            # --- Layout B: unit only in header, read from val_col or last columns ---
+            if val is None and unit_in_header and val_col is not None:
+                # Prefer the identified column, fall back to rightmost columns
+                candidates = []
+                if val_col < len(row):
+                    candidates.append(row[val_col])
+                candidates += list(reversed(row))  # include all as fallback
+                for cell in candidates:
+                    cell_t = cell.strip()
+                    if not cell_t:
+                        continue
+                    # Accept pure numbers (with optional commas/decimals)
+                    m = re.fullmatch(r'[\d,]+(?:\.\d+)?', cell_t)
+                    if not m:
+                        # Also accept numbers embedded in short strings
+                        nums = re.findall(r'(?<!\d)([\d,]{4,}(?:\.\d+)?)(?!\d)', cell_t)
+                        if not nums:
+                            continue
+                        cell_t = nums[-1]
+                    try:
+                        v = float(cell_t.replace(',', ''))
+                        if v >= 100:
+                            val = v
+                            break
+                    except ValueError:
+                        pass
+
+            if val is None or val < 10:
                 continue
 
-            # Match to known tax item (first match wins per key)
+            # Map row label to a known tax item (first match per key wins)
             for key, kws in _KEYWORD_MAP:
                 if key in found:
                     continue
