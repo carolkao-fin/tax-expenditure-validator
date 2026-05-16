@@ -431,18 +431,14 @@ def parse_full_report(table_list, paragraphs):
     data['items'] = items
 
     # ── 表4-2: 最初收入損失法 ─────────────────────────────────────────────────
-    tbl42 = find_table_by_header(table_list, '關稅損失')
+    # Structural first — 表格4 (表4-2) is the next table with 13 HS rows after 表格3
+    tbl42 = find_hs_table(table_list, skip=tbl41)
+    if tbl42 is None:
+        tbl42 = find_table_by_header(table_list, '關稅損失')
     if tbl42 is None:
         tbl42 = find_table_by_header(table_list, '最初收入損失')
     if tbl42 is None:
         tbl42 = find_table_by_header(table_list, '收入損失')
-    if tbl42 is None:
-        tbl42 = find_table_by_header(table_list, '降稅後稅率')
-        if tbl42 is tbl41:
-            tbl42 = None
-    if tbl42 is None:
-        # Structural: second table with most HS-code rows
-        tbl42 = find_hs_table(table_list, skip=tbl41)
 
     item_losses = {}
     if tbl42:
@@ -463,49 +459,47 @@ def parse_full_report(table_list, paragraphs):
     data['item_losses_reported'] = item_losses
 
     # ── formula tables ────────────────────────────────────────────────────────
+    # Formula tables are small (≤3 rows) and contain the × operator.
+    # Import tables have 15+ rows — the size gate prevents false matches.
+    # Identifying keywords come from the rolling-buffer title (preceding paragraph) + cell content.
     formula_tables = {}
     for title, rows in table_list:
-        cell_text = '\n'.join(' '.join(row) for row in rows) if rows else ''
-        combined  = title + '\n' + cell_text   # preceding paragraph context often has the keyword
+        if not rows or len(rows) > 3 or '×' not in '\n'.join(' '.join(r) for r in rows):
+            continue
+        cell_text = '\n'.join(' '.join(row) for row in rows)
+        combined  = title + '\n' + cell_text
         ct = combined.replace(' ', '').replace('　', '')
 
         def has(kw):   return kw in combined
         def has_re(p): return bool(re.search(p, ct))
 
         if 'vehicle_cit' not in formula_tables and (
-                has('汽車整車營利事業所得稅') or (has('整車業') and has('淨利率'))) and (
-                has_re(r'[×x]\s*15') or has_re(r'15%.*?20%')):
+                has('汽車整車') or has('整車業') or has('整車部分')):
             formula_tables['vehicle_cit'] = rows
 
         elif 'parts_cit' not in formula_tables and (
-                has('汽車零組件營利事業所得稅') or (has('零組件業') and has('淨利率'))) and (
-                has_re(r'[×x]\s*13') or has_re(r'13%.*?20%')):
+                has('汽車零組件') or has('零組件業') or has('零組件部分')):
             formula_tables['parts_cit'] = rows
 
         elif 'other_cit' not in formula_tables and (
-                has('其他工業及服務業營利事業所得稅') or (has('其他工業及服務業') and has('所得稅'))) and (
-                has_re(r'16[\.,]') or has_re(r'22[\.,]') or has('其他利潤')):
+                has('其他工業') or has('服務業')):
             formula_tables['other_cit'] = rows
 
-        elif 'dividend' not in formula_tables and (
-                has('股利所得稅') or has('股東個人股利') or has('股東股利')) and (
-                has('盈餘分配比例') or has('盈餘分配率') or has('分配比例') or has('分配率')):
-            formula_tables['dividend'] = rows
-
-        elif 'personal' not in formula_tables and (
-                has('個人所得稅') or has('個人綜合所得稅') or has('員工所得稅')) and (
-                has('平均受雇員工年薪') or has('平均薪資') or has('員工薪資') or has('增聘')):
-            formula_tables['personal'] = rows
-
-        elif 'commodity' not in formula_tables and (
-                has('貨物稅') and (has('貨物稅稅率') or has('汽車貨物稅')
-                                    or has_re(r'25%') or has_re(r'15%'))):
+        elif 'commodity' not in formula_tables and has('貨物稅'):
             formula_tables['commodity'] = rows
 
         elif 'vat' not in formula_tables and (
-                has('加值型營業稅') and (has('加值型營業稅稅率') or has('營業稅率')
-                                         or has_re(r'5%'))):
+                has('加值型營業稅') or (has('營業稅') and not has('貨物稅'))):
             formula_tables['vat'] = rows
+
+        elif 'personal' not in formula_tables and (
+                has('個人所得稅') or has('個人綜合所得稅') or has('增聘') or
+                (has('薪資') and has('所得稅'))):
+            formula_tables['personal'] = rows
+
+        elif 'dividend' not in formula_tables and (
+                has('股利') or has('股東') or has('盈餘分配')):
+            formula_tables['dividend'] = rows
 
     data['formula_tables'] = formula_tables
 
