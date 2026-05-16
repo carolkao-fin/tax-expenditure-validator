@@ -7,6 +7,7 @@ import re
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+import pdfplumber
 
 st.set_page_config(page_title="稅式支出評估報告驗證工具", layout="wide")
 
@@ -83,6 +84,37 @@ def extract_document(doc):
             )
             if rows:
                 table_list.append((table_page, rows))
+
+    return para_list, table_list
+
+
+def extract_pdf(file_bytes):
+    """
+    Extract paragraphs and tables from a PDF file with accurate page numbers.
+    Each page in the PDF is a hard page boundary — no heuristics required.
+    Returns (para_list, table_list) in the same format as extract_document().
+    """
+    para_list  = []
+    table_list = []
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            # Extract tables first (pdfplumber removes table regions from text)
+            tables = page.extract_tables() or []
+            for tbl in tables:
+                rows = []
+                for row in tbl:
+                    cells = [str(c or '').strip() for c in row]
+                    if any(c for c in cells):
+                        rows.append(cells)
+                if rows:
+                    table_list.append((page_num, rows))
+
+            # Extract remaining text line by line
+            text = page.extract_text(x_tolerance=3, y_tolerance=3) or ''
+            for line in text.split('\n'):
+                line = line.strip()
+                if line:
+                    para_list.append((page_num, line))
 
     return para_list, table_list
 
@@ -1137,20 +1169,21 @@ def main():
     st.markdown("上傳 Word 報告（完整版 F2 或簡要格式），自動驗證所有計算，並匯出各份 Excel 驗證報告。")
 
     uploaded_files = st.file_uploader(
-        "選擇 Word 檔案（可一次上傳多份）",
-        type=['docx'],
+        "選擇檔案（Word 或 PDF，可一次上傳多份）",
+        type=['docx', 'pdf'],
         accept_multiple_files=True,
-        help="支援完整版報告（億元）與簡要格式報告（千元），可同時上傳多份分別驗證",
+        help="支援 .docx（Word）與 .pdf，PDF 頁碼精確；支援完整版（億元）與簡要格式（千元）",
     )
 
     if not uploaded_files:
         st.markdown("""
 **支援格式：**
-- **完整版報告**（如「汽車零組件關稅調降稅式支出評估報告」.F2.docx）
+- **完整版報告**（如「汽車零組件關稅調降稅式支出評估報告」.F2.docx / .pdf）
   - 驗證：進口基準值、各品項關稅損失（表4-1/4-2）、各稅目公式計算、表格數值核對、最終淨損益
-- **簡要格式報告**（如「稅式支出評估報告(簡要格式)」.F2.docx）
+- **簡要格式報告**（如「稅式支出評估報告(簡要格式)」.F2.docx / .pdf）
   - 驗證：千元單位下各稅目公式計算、表格數值核對
 
+上傳 **PDF** 可獲得精確頁碼（PDF 每頁為明確邊界，無需推算）。
 每份檔案分別產生一份 Excel 驗證報告供下載，結果含**資料頁碼**欄位。
         """)
         return
@@ -1159,14 +1192,20 @@ def main():
         st.divider()
         st.subheader(f"📄 {uploaded_file.name}")
         try:
-            doc = Document(io.BytesIO(uploaded_file.read()))
-            para_list, table_list = extract_document(doc)
+            raw_bytes = uploaded_file.read()
+            if uploaded_file.name.lower().endswith('.pdf'):
+                para_list, table_list = extract_pdf(raw_bytes)
+                file_fmt = 'PDF'
+            else:
+                doc = Document(io.BytesIO(raw_bytes))
+                para_list, table_list = extract_document(doc)
+                file_fmt = 'Word'
             doc_type = detect_type(table_list, para_list)
 
             label = '完整版報告（億元）' if doc_type == 'full' else '簡要格式報告（千元）'
             max_page = max((p for p, _ in para_list), default=1)
             max_page = max(max_page, max((p for p, _ in table_list), default=1))
-            st.caption(f"識別類型：{label}　｜　表格數量：{len(table_list)}　｜　偵測頁數：第1～{max_page}頁")
+            st.caption(f"識別類型：{label}　｜　格式：{file_fmt}　｜　表格數量：{len(table_list)}　｜　偵測頁數：第1～{max_page}頁")
 
             if doc_type == 'full':
                 data = parse_full_report(table_list, para_list)
