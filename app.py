@@ -14,8 +14,14 @@ st.set_page_config(page_title="稅式支出評估報告驗證工具", layout="wi
 
 def extract_document(doc):
     """
-    Walk the document body in order, counting page numbers via explicit
-    page-break elements (w:br w:type="page").
+    Walk the document body in order, tracking page numbers via:
+      1. w:lastRenderedPageBreak — Word's soft/auto page break record (most common)
+      2. w:br w:type="page"     — explicit user-inserted page break
+    For a paragraph: if any of the above appears BEFORE text in a run,
+    the paragraph starts on a new page (increment before recording).
+    Explicit breaks at the END of a paragraph push NEXT element to new page.
+    For tables: record start page, then accumulate all breaks inside to keep
+    current_page correct for subsequent body elements.
     Returns:
       para_list  : [(page_num, text), ...]
       table_list : [(page_num, [[cell,...], ...]), ...]
@@ -28,12 +34,33 @@ def extract_document(doc):
         local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
 
         if local == 'p':
-            for br in elem.iter(qn('w:br')):
-                if br.get(qn('w:type')) == 'page':
-                    current_page += 1
+            breaks_before_text = 0
+            breaks_after_text  = 0
+            seen_text = False
+
+            for run in elem:
+                run_local = run.tag.split('}')[-1] if '}' in run.tag else run.tag
+                if run_local != 'r':
+                    continue
+                for child in run:
+                    cl = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                    if cl == 'lastRenderedPageBreak':
+                        if not seen_text:
+                            breaks_before_text += 1
+                        # mid-paragraph rendered break — still need to track for tables after
+                    elif cl == 'br' and child.get(qn('w:type')) == 'page':
+                        if seen_text:
+                            breaks_after_text += 1
+                        else:
+                            breaks_before_text += 1
+                    elif cl == 't' and (child.text or '').strip():
+                        seen_text = True
+
+            current_page += breaks_before_text
             text = ''.join(n.text or '' for n in elem.iter(qn('w:t'))).strip()
             if text:
                 para_list.append((current_page, text))
+            current_page += breaks_after_text
 
         elif local == 'tbl':
             table_page = current_page
@@ -41,13 +68,19 @@ def extract_document(doc):
             for tr in elem.iter(qn('w:tr')):
                 cells = []
                 for tc in tr.iter(qn('w:tc')):
-                    for br in tc.iter(qn('w:br')):
-                        if br.get(qn('w:type')) == 'page':
-                            current_page += 1
                     cell_text = ''.join(n.text or '' for n in tc.iter(qn('w:t'))).strip()
                     cells.append(cell_text)
                 if cells:
                     rows.append(cells)
+            # Accumulate all page breaks inside the table so subsequent body
+            # elements get the correct page number.
+            current_page += sum(
+                1 for _ in elem.iter(qn('w:lastRenderedPageBreak'))
+            )
+            current_page += sum(
+                1 for br in elem.iter(qn('w:br'))
+                if br.get(qn('w:type')) == 'page'
+            )
             if rows:
                 table_list.append((table_page, rows))
 
@@ -216,8 +249,12 @@ _KEYWORD_MAP = [
 
 def scan_tables_financial(table_list, unit):
     """
-    Scan every table for financial figures in `unit`.
-    Handles (A) unit inline per row, and (B) unit only in column header.
+    Scan every table for financial figures in `unit` (千元 or 億元).
+    Three layouts handled:
+      A — unit appears inline in each row:  「2,240,360千元」
+      B — unit only in column header:       header says「評估金額（千元）」, rows are plain numbers
+      C — unit nowhere in table but rows have tax keywords + large numbers
+          (e.g. simplified-format form tables where unit is implied)
     Returns dict: {item_key: (value, page)}.
     """
     found = {}
@@ -227,12 +264,22 @@ def scan_tables_financial(table_list, unit):
             continue
 
         table_flat = ' '.join(c for row in rows for c in row)
-        if unit not in table_flat:
+        unit_in_table = unit in table_flat
+
+        # Check whether this table has any tax-related keywords
+        has_tax_kw = any(
+            any(kw in table_flat for kw in kws)
+            for _, kws in _KEYWORD_MAP
+        )
+
+        # Skip tables with neither unit nor tax keywords
+        if not unit_in_table and not has_tax_kw:
             continue
 
-        header_text = ' '.join(rows[0])
+        header_text = ' '.join(rows[0]) if rows else ''
         unit_in_header = unit in header_text
 
+        # Identify the value column when unit is in the header
         val_col = None
         if unit_in_header:
             for ci, cell in enumerate(rows[0]):
@@ -244,30 +291,32 @@ def scan_tables_financial(table_list, unit):
 
         for ri, row in enumerate(rows):
             if ri == 0 and unit_in_header:
-                continue
+                continue  # skip header row
 
             row_text = ' '.join(c.strip() for c in row if c.strip())
             if not row_text:
                 continue
 
+            # Skip formula/calculation rows
             if ('×' in row_text or '＋' in row_text) and unit in row_text:
                 continue
 
             val = None
 
-            # Layout A: unit appears inline
-            inline = re.findall(r'([\d,]+(?:\.\d+)?)\s*' + re.escape(unit), row_text)
-            if inline:
-                for n in reversed(inline):
-                    try:
-                        v = float(n.replace(',', ''))
-                        if v >= 10:
-                            val = v
-                            break
-                    except ValueError:
-                        pass
+            # ── Layout A: unit inline ────────────────────────────────────────
+            if unit_in_table:
+                inline = re.findall(r'([\d,]+(?:\.\d+)?)\s*' + re.escape(unit), row_text)
+                if inline:
+                    for n in reversed(inline):
+                        try:
+                            v = float(n.replace(',', ''))
+                            if v >= 10:
+                                val = v
+                                break
+                        except ValueError:
+                            pass
 
-            # Layout B: unit only in header — read from val_col or last columns
+            # ── Layout B: unit only in header ────────────────────────────────
             if val is None and unit_in_header and val_col is not None:
                 candidates = []
                 if val_col < len(row):
@@ -277,8 +326,8 @@ def scan_tables_financial(table_list, unit):
                     cell_t = cell.strip()
                     if not cell_t:
                         continue
-                    m = re.fullmatch(r'[\d,]+(?:\.\d+)?', cell_t)
-                    if not m:
+                    m_full = re.fullmatch(r'[\d,]+(?:\.\d+)?', cell_t)
+                    if not m_full:
                         nums = re.findall(r'(?<!\d)([\d,]{4,}(?:\.\d+)?)(?!\d)', cell_t)
                         if not nums:
                             continue
@@ -291,9 +340,37 @@ def scan_tables_financial(table_list, unit):
                     except ValueError:
                         pass
 
+            # ── Layout C: no unit anywhere, but table has tax keywords ───────
+            # Try the rightmost cell that contains only a large plain number.
+            if val is None and not unit_in_table and has_tax_kw:
+                for cell in reversed(row):
+                    cell_t = cell.strip()
+                    if not cell_t:
+                        continue
+                    # Accept pure digit strings (with optional commas)
+                    if re.fullmatch(r'[\d,]+', cell_t):
+                        try:
+                            v = float(cell_t.replace(',', ''))
+                            if v >= 1000:   # higher threshold — no unit to confirm
+                                val = v
+                                break
+                        except ValueError:
+                            pass
+                    # Also accept "NNN（千元）" style annotations
+                    m_ann = re.search(r'([\d,]+)\s*[（(]?千元[）)]?', cell_t)
+                    if m_ann:
+                        try:
+                            v = float(m_ann.group(1).replace(',', ''))
+                            if v >= 100:
+                                val = v
+                                break
+                        except ValueError:
+                            pass
+
             if val is None or val < 10:
                 continue
 
+            # Map to tax item (first match per key wins)
             for key, kws in _KEYWORD_MAP:
                 if key in found:
                     continue
@@ -989,7 +1066,9 @@ def main():
             doc_type = detect_type(table_list, para_list)
 
             label = '完整版報告（億元）' if doc_type == 'full' else '簡要格式報告（千元）'
-            st.caption(f"識別類型：{label}　｜　表格數量：{len(table_list)}")
+            max_page = max((p for p, _ in para_list), default=1)
+            max_page = max(max_page, max((p for p, _ in table_list), default=1))
+            st.caption(f"識別類型：{label}　｜　表格數量：{len(table_list)}　｜　偵測頁數：第1～{max_page}頁")
 
             if doc_type == 'full':
                 data = parse_full_report(table_list, para_list)
