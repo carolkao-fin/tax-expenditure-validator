@@ -64,26 +64,41 @@ def extract_document(doc):
             current_page += breaks_after_text
 
         elif local == 'tbl':
-            table_page = current_page
-            rows = []
+            # Split the table at every internal page break so each chunk
+            # gets the correct page number (fixes multi-page tables showing page 1).
+            chunk_start_page = current_page
+            chunk_rows = []
+
             for tr in elem.iter(qn('w:tr')):
+                # Count page breaks that occur before any text in this row
+                breaks_before = 0
+                seen_text_in_row = False
+                for run_elem in tr.iter(qn('w:r')):
+                    for child in run_elem:
+                        cl = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                        if cl == 'lastRenderedPageBreak' and not seen_text_in_row:
+                            breaks_before += 1
+                        elif cl == 'br' and child.get(qn('w:type')) == 'page' and not seen_text_in_row:
+                            breaks_before += 1
+                        elif cl == 't' and (child.text or '').strip():
+                            seen_text_in_row = True
+
+                if breaks_before > 0:
+                    if chunk_rows:
+                        table_list.append((chunk_start_page, chunk_rows))
+                        chunk_rows = []
+                    current_page += breaks_before
+                    chunk_start_page = current_page
+
                 cells = []
                 for tc in tr.iter(qn('w:tc')):
                     cell_text = ''.join(n.text or '' for n in tc.iter(qn('w:t'))).strip()
                     cells.append(cell_text)
                 if cells:
-                    rows.append(cells)
-            # Accumulate all page breaks inside the table so subsequent body
-            # elements get the correct page number.
-            current_page += sum(
-                1 for _ in elem.iter(qn('w:lastRenderedPageBreak'))
-            )
-            current_page += sum(
-                1 for br in elem.iter(qn('w:br'))
-                if br.get(qn('w:type')) == 'page'
-            )
-            if rows:
-                table_list.append((table_page, rows))
+                    chunk_rows.append(cells)
+
+            if chunk_rows:
+                table_list.append((chunk_start_page, chunk_rows))
 
     return para_list, table_list
 
@@ -220,11 +235,18 @@ def status_icon(passed):
     return '✅' if passed else '❌'
 
 def find_table_by_header(table_list, *keywords):
-    """Returns (page, rows) or (None, None)."""
+    """
+    Returns (page, rows) or (None, None).
+    Searches the first 3 rows so tables with a merged group-header row above
+    the actual column headers are still matched.
+    """
     for page, rows in table_list:
         if not rows:
             continue
-        header = ' '.join(cell.replace('\n', '') for cell in rows[0])
+        header = ' '.join(
+            ' '.join(cell.replace('\n', '') for cell in row)
+            for row in rows[:3]
+        )
         if all(kw in header for kw in keywords):
             return page, rows
     return None, None
@@ -464,10 +486,23 @@ def parse_full_report(table_list, para_list):
                                'import_5yr': imp, 'current_rate': cur_rate, 'after_rate': aft_rate})
     data['items'] = items
 
-    # 表4-2
+    # 表4-2 — try multiple header patterns
     p42, tbl42 = find_table_by_header(table_list, '關稅損失')
     if tbl42 is None:
         p42, tbl42 = find_table_by_header(table_list, '最初收入損失')
+    if tbl42 is None:
+        p42, tbl42 = find_table_by_header(table_list, '收入損失', '稅則')
+    if tbl42 is None:
+        p42, tbl42 = find_table_by_header(table_list, '降稅後稅率', '關稅')
+    # Last resort: a table with multiple HS-code rows and a 合計 row
+    if tbl42 is None:
+        for page, rows in table_list:
+            hs_rows = [r for r in rows if r and re.match(r'\d{4}[\.\d]*', r[0].strip())]
+            total_row = [r for r in rows if r and '合計' in r[0]]
+            flat = ' '.join(c for r in rows for c in r)
+            if len(hs_rows) >= 3 and total_row and '億元' in flat:
+                p42, tbl42 = page, rows
+                break
     item_losses = {}
     if tbl42:
         pages['table42'] = p42
@@ -501,10 +536,13 @@ def parse_full_report(table_list, para_list):
         elif '其他工業及服務業營利事業所得稅' in cell_text and '16.' in cell_text:
             formula_tables['other_cit'] = rows
             pages['other_cit'] = page
-        elif '股利所得稅' in cell_text and '盈餘分配比例' in cell_text:
+        elif ('股利所得稅' in cell_text or '股東個人股利' in cell_text) and (
+                '盈餘分配比例' in cell_text or '盈餘分配率' in cell_text or '分配比例' in cell_text):
             formula_tables['dividend'] = rows
             pages['dividend'] = page
-        elif '個人所得稅' in cell_text and '平均受雇員工年薪' in cell_text:
+        elif ('個人所得稅' in cell_text or '個人綜合所得稅' in cell_text or '薪資所得稅' in cell_text) and (
+                '平均受雇員工年薪' in cell_text or '平均薪資' in cell_text or '員工薪資' in cell_text
+                or '增聘' in cell_text):
             formula_tables['personal'] = rows
             pages['personal'] = page
         elif '汽車貨物稅' in cell_text and '貨物稅稅率' in cell_text:
@@ -552,6 +590,22 @@ def parse_full_report(table_list, para_list):
     small_vals = [v for v in all_vals if v < 5]
     data['dividend_tax_reported'] = small_vals[-1] if small_vals else 0.77
     formulas['dividend'] = compact_formula_full(txt) if txt else ''
+    # Extract sub-components for dividend computation
+    # Formula: profit × (1-CIT) × dist_rate × personal_rate  (or ×1 for some variants)
+    div_params = {}
+    if txt:
+        m_dist = re.search(r'盈餘分配(?:比例|率)[^\d]*([\d\.]+)%', txt)
+        m_rate = re.search(r'(?:個人|股利)[^\d]*所得稅率?[^\d]*([\d\.]+)%', txt)
+        m_profit = re.search(r'([\d\.]+)\s*億元.*?(?:稅前|稅後|利潤|利益)', txt)
+        if not m_profit:
+            m_profit = re.search(r'(?:稅前|稅後|利潤).*?([\d\.]+)\s*億元', txt)
+        if m_dist:
+            div_params['dist_rate'] = float(m_dist.group(1)) / 100
+        if m_rate:
+            div_params['personal_rate'] = float(m_rate.group(1)) / 100
+        if m_profit:
+            div_params['profit'] = float(m_profit.group(1))
+    data['dividend_params'] = div_params
 
     txt = get_txt('personal')
     m = re.search(r'合計\s*=\s*([\d\.]+)\s*萬元', txt)
@@ -561,6 +615,27 @@ def parse_full_report(table_list, para_list):
     else:
         data['personal_tax_reported'] = float(m.group(1)) / 10000
     formulas['personal'] = compact_formula_full(txt) if txt else ''
+    # Extract sub-components for personal tax computation
+    # Formula: employees × avg_salary × rate
+    per_params = {}
+    if txt:
+        m_emp = re.search(r'(?:增聘|受雇員工|員工人數)[^\d]*(\d[\d,]*)\s*人', txt)
+        m_sal = re.search(r'平均.*?(?:年薪|薪資)[^\d]*([\d\.]+)\s*萬元', txt)
+        if not m_sal:
+            m_sal = re.search(r'([\d\.]+)\s*萬元.*?(?:年薪|薪資)', txt)
+        m_rate = re.search(r'(?:個人|綜合).*?所得稅率?[^\d]*([\d\.]+)%', txt)
+        if not m_rate:
+            m_rate = re.search(r'(?:所得稅率?|適用稅率)[^\d]*([\d\.]+)%', txt)
+        if m_emp:
+            per_params['employees'] = float(m_emp.group(1).replace(',', ''))
+        if m_sal:
+            per_params['salary_wan'] = float(m_sal.group(1))
+        if m_rate:
+            per_params['rate'] = float(m_rate.group(1)) / 100
+        if per_params.get('employees') and per_params.get('salary_wan') and per_params.get('rate'):
+            per_params['calc'] = round2(
+                per_params['employees'] * per_params['salary_wan'] * per_params['rate'] / 10000)
+    data['personal_params'] = per_params
 
     txt = get_txt('commodity')
     m = re.search(r'新臺幣\s*([\d\.]+)\s*億元', txt)
@@ -904,18 +979,43 @@ def verify_full(data):
         status_icon(ok(rep_tcit, calc_tcit)) if rep_tcit else '⚠️', '', None))
 
     rep_per = data.get('personal_tax_reported', 0.0287)
-    results.append(row_result(
-        SEC_PER, '個人綜合所得稅 (億元)',
-        forms.get('personal') or '增聘員工薪資 × 適用稅率',
-        fmt(rep_per), '（依文件公式，不重新推算）', '—', '⚠️',
-        '此項依文件所示公式與參數確認', pages.get('personal')))
+    per_params = data.get('personal_params', {})
+    if per_params.get('calc') is not None:
+        calc_per = per_params['calc']
+        per_note = (f"{per_params.get('employees',0):.0f}人"
+                    f"×{per_params.get('salary_wan',0):.2f}萬元"
+                    f"×{per_params.get('rate',0)*100:.1f}%")
+        results.append(row_result(
+            SEC_PER, '個人綜合所得稅 (億元)',
+            forms.get('personal') or per_note,
+            fmt(rep_per), fmt(calc_per), fmt(rep_per - calc_per),
+            status_icon(ok(rep_per, calc_per)), per_note, pages.get('personal')))
+    else:
+        results.append(row_result(
+            SEC_PER, '個人綜合所得稅 (億元)',
+            forms.get('personal') or '增聘員工薪資 × 適用稅率',
+            fmt(rep_per), '（參數未能自動抽取）', '—', '⚠️',
+            '請手動確認員工數、薪資、稅率', pages.get('personal')))
 
     rep_div = data.get('dividend_tax_reported', 0.77)
-    results.append(row_result(
-        SEC_DIV, '股東個人股利所得稅 (億元)',
-        forms.get('dividend') or '產值利潤×80%×56%×30%×40.45%×28%',
-        fmt(rep_div), '（依文件公式，不重新推算）', '—', '⚠️',
-        '此項依文件所示公式與參數確認', pages.get('dividend')))
+    div_params = data.get('dividend_params', {})
+    if (div_params.get('profit') and div_params.get('dist_rate') and div_params.get('personal_rate')):
+        calc_div = round2(
+            div_params['profit'] * (1 - 0.20) * div_params['dist_rate'] * div_params['personal_rate'])
+        div_note = (f"{div_params['profit']}億元"
+                    f"×80%×{div_params['dist_rate']*100:.0f}%"
+                    f"×{div_params['personal_rate']*100:.0f}%")
+        results.append(row_result(
+            SEC_DIV, '股東個人股利所得稅 (億元)',
+            forms.get('dividend') or div_note,
+            fmt(rep_div), fmt(calc_div), fmt(rep_div - calc_div),
+            status_icon(ok(rep_div, calc_div)), div_note, pages.get('dividend')))
+    else:
+        results.append(row_result(
+            SEC_DIV, '股東個人股利所得稅 (億元)',
+            forms.get('dividend') or '利潤×(1-CIT)×盈餘分配率×個人稅率',
+            fmt(rep_div), '（參數未能自動抽取）', '—', '⚠️',
+            '請手動確認利潤基數、分配率、稅率', pages.get('dividend')))
 
     # ── 淨損益 ────────────────────────────────────────────────────────────────
     calc_net = round2(calc_tcit + rep_div + rep_per + calc_ct + calc_vat - rep_loss)
