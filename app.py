@@ -26,7 +26,8 @@ def extract_document(doc):
     tbl_map    = {id(t._tbl): t for t in doc.tables}
     paragraphs = []
     table_list = []
-    last_para  = ''
+    para_buf   = []   # rolling window — captures the last WINDOW paragraphs
+    WINDOW     = 4    # look back up to 4 paragraphs for table captions
 
     def _rows_from_tbl(tbl):
         rows = []
@@ -42,25 +43,28 @@ def extract_document(doc):
         return rows
 
     def _visit(elem):
-        nonlocal last_para
         tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
 
         if tag == 'p':
             text = ''.join(n.text or '' for n in elem.iter(qn('w:t'))).strip()
             if text:
                 paragraphs.append(text)
-                last_para = text
+                para_buf.append(text)
+                if len(para_buf) > WINDOW:
+                    para_buf.pop(0)
 
         elif tag == 'tbl':
             tbl = tbl_map.get(id(elem))
             if tbl is not None:
                 rows = _rows_from_tbl(tbl)
                 if rows:
-                    table_list.append((last_para, rows))
-                last_para = ''
+                    # Title = concatenation of recent paragraphs so that captions
+                    # like「表4-1…進口金額…」 2 paragraphs above are still captured.
+                    context = ' | '.join(para_buf)
+                    table_list.append((context, rows))
+                para_buf.clear()   # reset: next table gets a fresh buffer
 
         elif tag in ('sdt',):
-            # Content-control wrapper — recurse into its content body
             content = elem.find(qn('w:sdtContent'))
             target  = content if content is not None else elem
             for child in target:
@@ -391,16 +395,17 @@ def parse_full_report(table_list, paragraphs):
     data  = {}
 
     # ── 表4-1: 5-year average import values ──────────────────────────────────
-    tbl41 = find_table_by_header(table_list, '5年平均')
+    # Structural detection first — avoids picking 表格1 (component list) over 表格3 (表4-1)
+    # because both share '現行稅率'/'降稅後稅率' headers but 表格3 has more HS-code rows
+    tbl41 = find_hs_table(table_list)
     if tbl41 is None:
-        tbl41 = find_table_by_header(table_list, '現行稅率', '降稅後稅率')
+        tbl41 = find_table_by_header(table_list, '5年平均')
     if tbl41 is None:
         tbl41 = find_table_by_header(table_list, '進口金額')
     if tbl41 is None:
-        tbl41 = find_table_by_header(table_list, '進口', '現行稅率')
+        tbl41 = find_table_by_header(table_list, '現行稅率', '降稅後稅率')
     if tbl41 is None:
-        # Structural: table with most HS-code rows
-        tbl41 = find_hs_table(table_list)
+        tbl41 = find_table_by_header(table_list, '進口', '現行稅率')
 
     items = []
     if tbl41:
@@ -461,9 +466,10 @@ def parse_full_report(table_list, paragraphs):
     formula_tables = {}
     for title, rows in table_list:
         cell_text = '\n'.join(' '.join(row) for row in rows) if rows else ''
-        ct = cell_text.replace(' ', '').replace('　', '')
+        combined  = title + '\n' + cell_text   # preceding paragraph context often has the keyword
+        ct = combined.replace(' ', '').replace('　', '')
 
-        def has(kw):   return kw in cell_text
+        def has(kw):   return kw in combined
         def has_re(p): return bool(re.search(p, ct))
 
         if 'vehicle_cit' not in formula_tables and (
