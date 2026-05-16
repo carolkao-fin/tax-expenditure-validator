@@ -492,14 +492,17 @@ def parse_full_report(table_list, paragraphs):
                 has('加值型營業稅') or (has('營業稅') and not has('貨物稅'))):
             formula_tables['vat'] = rows
 
-        elif 'personal' not in formula_tables and (
-                has('個人所得稅') or has('個人綜合所得稅') or has('增聘') or
-                (has('薪資') and has('所得稅'))):
-            formula_tables['personal'] = rows
-
+        # Dividend before personal — '個人所得稅' is a substring of '股東個人股利所得稅',
+        # so personal check must not run before dividend check.
         elif 'dividend' not in formula_tables and (
-                has('股利') or has('股東') or has('盈餘分配')):
+                has('股利') or (has('股東') and has('盈餘'))):
             formula_tables['dividend'] = rows
+
+        elif 'personal' not in formula_tables and (
+                has('增聘') or has('受雇員工') or
+                (has('薪資') and not has('股利') and not has('股東')) or
+                (has('個人綜合所得稅') and not has('股利') and not has('股東'))):
+            formula_tables['personal'] = rows
 
     data['formula_tables'] = formula_tables
 
@@ -534,10 +537,20 @@ def parse_full_report(table_list, paragraphs):
     data['other_cit_reported'] = float(m2.group(1)) if m2 else None
     formulas['other_cit'] = compact_formula_full(txt) if txt else ''
 
+    # Paragraph-level text search for stated totals — more reliable than formula table
+    # extraction when formula tables only show sub-calculations (e.g. one shareholder type).
+    all_paras = '\n'.join(paragraphs)
+
+    m = re.search(
+        r'股(?:東個人股利|東股利|利)[^。\n]{0,200}新臺幣\s*([\d\.]+)\s*億元',
+        all_paras, re.DOTALL)
+    div_text_val = float(m.group(1)) if m else None
+
     txt = get_txt('dividend')
-    all_vals  = [float(v) for v in re.findall(r'(?<!\d)([\d]+\.[\d]+)\s*億元', txt)]
+    all_vals   = [float(v) for v in re.findall(r'(?<!\d)([\d]+\.[\d]+)\s*億元', txt)]
     small_vals = [v for v in all_vals if v < 5]
-    data['dividend_tax_reported'] = small_vals[-1] if small_vals else 0.77
+    div_formula_val = small_vals[-1] if small_vals else None
+    data['dividend_tax_reported'] = div_text_val or div_formula_val or 0.77
     formulas['dividend'] = compact_formula_full(txt) if txt else ''
     div_params = {}
     if txt:
@@ -551,13 +564,23 @@ def parse_full_report(table_list, paragraphs):
         if m_profit: div_params['profit']        = float(m_profit.group(1))
     data['dividend_params'] = div_params
 
+    m = re.search(
+        r'個人綜合所得稅[^。\n]{0,200}新臺幣\s*([\d\.]+)\s*億元',
+        all_paras, re.DOTALL)
+    per_text_val_yi = float(m.group(1)) if m else None
+    if not per_text_val_yi:
+        m = re.search(
+            r'個人綜合所得稅[^。\n]{0,200}新臺幣\s*([\d,]+)\s*萬元', all_paras)
+        per_text_val_yi = float(m.group(1).replace(',', '')) / 10000 if m else None
+
     txt = get_txt('personal')
     m = re.search(r'合計\s*=\s*([\d\.]+)\s*萬元', txt)
     if not m:
         vals = re.findall(r'=\s*([\d\.]+)\s*萬元', txt)
-        data['personal_tax_reported'] = float(vals[-1]) / 10000 if vals else 0.0287
+        per_formula_val = float(vals[-1]) / 10000 if vals else None
     else:
-        data['personal_tax_reported'] = float(m.group(1)) / 10000
+        per_formula_val = float(m.group(1)) / 10000
+    data['personal_tax_reported'] = per_text_val_yi or per_formula_val or 0.0287
     formulas['personal'] = compact_formula_full(txt) if txt else ''
     per_params = {}
     if txt:
