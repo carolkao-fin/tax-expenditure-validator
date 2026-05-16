@@ -92,25 +92,43 @@ def extract_pdf(file_bytes):
     """
     Extract paragraphs and tables from a PDF file with accurate page numbers.
     Each page in the PDF is a hard page boundary — no heuristics required.
+    Table regions are excluded from text extraction to avoid duplication.
     Returns (para_list, table_list) in the same format as extract_document().
     """
     para_list  = []
     table_list = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            # Extract tables first (pdfplumber removes table regions from text)
-            tables = page.extract_tables() or []
-            for tbl in tables:
+            # Detect table objects and extract structured rows
+            found_tables = page.find_tables()
+            table_bboxes = []
+            for tbl_obj in found_tables:
+                table_bboxes.append(tbl_obj.bbox)
                 rows = []
-                for row in tbl:
+                for row in tbl_obj.extract():
                     cells = [str(c or '').strip() for c in row]
                     if any(c for c in cells):
                         rows.append(cells)
                 if rows:
                     table_list.append((page_num, rows))
 
-            # Extract remaining text line by line
-            text = page.extract_text(x_tolerance=3, y_tolerance=3) or ''
+            # Extract text only from areas outside table bounding boxes
+            # so table content doesn't appear twice in all_text.
+            if table_bboxes:
+                def not_in_any_table(obj, _bboxes=table_bboxes):
+                    ox0 = obj.get('x0', 0)
+                    ox1 = obj.get('x1', 0)
+                    ot  = obj.get('top', 0)
+                    ob  = obj.get('bottom', 0)
+                    for x0, top, x1, bottom in _bboxes:
+                        if ox0 >= x0 - 2 and ox1 <= x1 + 2 and ot >= top - 2 and ob <= bottom + 2:
+                            return False
+                    return True
+                text_page = page.filter(not_in_any_table)
+            else:
+                text_page = page
+
+            text = text_page.extract_text(x_tolerance=3, y_tolerance=3) or ''
             for line in text.split('\n'):
                 line = line.strip()
                 if line:
@@ -733,7 +751,9 @@ def parse_simplified_report(table_list, para_list):
     table_values.update(summary_tv)          # summary overrides generic scan
     data['table_values'] = table_values
 
-    # Backfill any reported values that regex couldn't extract from prose
+    # Sync pages and values from the summary table.
+    # Always update the page (summary table location is most authoritative);
+    # only set the value when regex prose search didn't already find it.
     _backfill = [
         ('tariff_loss_reported_k',  'tariff_loss'),
         ('commodity_tax_reported_k','commodity'),
@@ -744,10 +764,15 @@ def parse_simplified_report(table_list, para_list):
         ('net_reported_k',          'net'),
     ]
     for data_key, tv_key in _backfill:
-        if data.get(data_key) is None and tv_key in summary_tv:
-            val, pg = summary_tv[tv_key]
+        if tv_key not in summary_tv:
+            continue
+        val, pg = summary_tv[tv_key]
+        # Always overwrite page with the summary table page
+        page_key = data_key.replace('_reported_k', '').replace('_tax', '')
+        pages[page_key] = pg
+        # Only backfill value when regex found nothing
+        if data.get(data_key) is None:
             data[data_key] = val
-            pages[data_key.replace('_reported_k', '').replace('_tax', '')] = pg
 
     return data
 
